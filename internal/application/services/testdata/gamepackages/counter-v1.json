@@ -1,0 +1,88 @@
+{
+  "schemaVersion": "game.zerone.io/v1",
+  "package": {
+    "key": "io.example.counter",
+    "version": "1.0.0",
+    "displayName": "计数器测试包",
+    "description": "验证游戏包注册、动作、效果、事件与状态差异，不包含任何具体游戏领域逻辑。"
+  },
+  "registry": {
+    "metrics": [
+      {
+        "id": "count",
+        "name": "当前计数",
+        "type": "integer",
+        "initial": 0,
+        "minimum": -100,
+        "maximum": 100
+      }
+    ],
+    "actions": [
+      {
+        "id": "increase",
+        "name": "增加计数",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "amount": { "type": "integer", "minimum": 1, "maximum": 10 }
+          }
+        },
+        "effects": [
+          {
+            "operation": "increment",
+            "target": "count",
+            "valueFrom": "amount",
+            "defaultValue": 1
+          }
+        ],
+        "emits": "counter.increased"
+      },
+      {
+        "id": "decrease",
+        "name": "减少计数",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "amount": { "type": "integer", "minimum": 1, "maximum": 10 }
+          }
+        },
+        "effects": [
+          {
+            "operation": "decrement",
+            "target": "count",
+            "valueFrom": "amount",
+            "defaultValue": 1
+          }
+        ],
+        "emits": "counter.decreased"
+      },
+      {
+        "id": "reset",
+        "name": "归零",
+        "effects": [
+          { "operation": "set", "target": "count", "value": 0 }
+        ],
+        "emits": "counter.reset"
+      }
+    ],
+    "events": [
+      { "id": "counter.increased", "name": "计数已增加" },
+      { "id": "counter.decreased", "name": "计数已减少" },
+      { "id": "counter.reset", "name": "计数已归零" }
+    ],
+    "endings": []
+  },
+  "acceptanceScenarios": [
+    {
+      "id": "counter_basic",
+      "name": "增加三次再减少一次",
+      "description": "验证输入参数、默认值、事件顺序与最终状态。",
+      "commands": [
+        { "actionId": "increase", "input": { "amount": 3 } },
+        { "actionId": "decrease" }
+      ]
+    }
+  ]
+}

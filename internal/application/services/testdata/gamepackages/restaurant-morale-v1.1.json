@@ -1,0 +1,84 @@
+{
+  "schemaVersion": "game.zerone.io/v1",
+  "package": {
+    "key": "io.example.restaurant",
+    "version": "1.1.0",
+    "displayName": "餐厅经营测试包（员工士气扩展）",
+    "description": "在不修改 Kernel 的情况下，通过新包版本增加员工士气指标、团建动作和对应事件。"
+  },
+  "registry": {
+    "metrics": [
+      { "id": "inventory", "name": "食材库存", "type": "integer", "initial": 5, "minimum": 0, "maximum": 100 },
+      { "id": "cash", "name": "可用现金", "type": "integer", "initial": 100, "minimum": 0, "maximum": 10000 },
+      { "id": "operating", "name": "营业状态", "type": "boolean", "initial": true },
+      { "id": "employee_morale", "name": "员工士气", "type": "integer", "initial": 60, "minimum": 0, "maximum": 100 }
+    ],
+    "actions": [
+      {
+        "id": "purchase",
+        "name": "采购食材",
+        "effects": [
+          { "operation": "decrement", "target": "cash", "value": 20 },
+          { "operation": "increment", "target": "inventory", "value": 5 }
+        ],
+        "emits": "restaurant.purchased"
+      },
+      {
+        "id": "wait",
+        "name": "等待一天",
+        "effects": [
+          { "operation": "decrement", "target": "inventory", "value": 1 },
+          { "operation": "decrement", "target": "employee_morale", "value": 2 }
+        ],
+        "emits": "restaurant.day_waited"
+      },
+      {
+        "id": "supply_interruption",
+        "name": "模拟供应中断",
+        "effects": [
+          { "operation": "decrement", "target": "inventory", "value": 4 },
+          { "operation": "decrement", "target": "employee_morale", "value": 10 }
+        ],
+        "emits": "restaurant.supply_interrupted"
+      },
+      {
+        "id": "close",
+        "name": "停止营业",
+        "effects": [
+          { "operation": "set", "target": "operating", "value": false }
+        ],
+        "emits": "restaurant.closed"
+      },
+      {
+        "id": "team_building",
+        "name": "组织团建",
+        "effects": [
+          { "operation": "decrement", "target": "cash", "value": 10 },
+          { "operation": "increment", "target": "employee_morale", "value": 15 }
+        ],
+        "emits": "restaurant.morale_improved"
+      }
+    ],
+    "events": [
+      { "id": "restaurant.purchased", "name": "采购完成" },
+      { "id": "restaurant.day_waited", "name": "一天结束" },
+      { "id": "restaurant.supply_interrupted", "name": "供应中断" },
+      { "id": "restaurant.closed", "name": "餐厅停业" },
+      { "id": "restaurant.morale_improved", "name": "员工士气提高" }
+    ],
+    "endings": [
+      { "id": "restaurant_closed", "name": "餐厅停业", "description": "M0仅登记结局元数据；正式条件判断在M1实现。" }
+    ]
+  },
+  "acceptanceScenarios": [
+    {
+      "id": "morale_extension",
+      "name": "加载员工士气扩展",
+      "description": "验证新增指标、动作和事件只来自包版本，不需要修改Kernel。",
+      "commands": [
+        { "actionId": "team_building" },
+        { "actionId": "wait" }
+      ]
+    }
+  ]
+}

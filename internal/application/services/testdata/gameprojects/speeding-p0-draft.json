@@ -1,0 +1,461 @@
+{
+  "metrics": [
+    { "id": "liquidity", "name": "可用资金", "description": "可以立即调动、用于完成交易和维持公司的资金", "displayUnit": "点", "type": "number", "initial": 50, "minimum": 0, "maximum": 100 },
+    { "id": "control", "name": "公司控制权", "description": "玩家对公司决策与执行的实际控制程度", "displayUnit": "点", "type": "number", "initial": 70, "minimum": 0, "maximum": 100 },
+    { "id": "evidence", "name": "证据完整度", "description": "关键材料是否被固定并且能够经受审查", "displayUnit": "点", "type": "number", "initial": 20, "minimum": 0, "maximum": 100 },
+    { "id": "regulatory_pressure", "name": "监管压力", "description": "监管机构采取强制措施的紧迫程度", "displayUnit": "点", "type": "number", "initial": 25, "minimum": 0, "maximum": 100 },
+    { "id": "board_support", "name": "董事会支持", "description": "董事会继续授权玩家处理危机的意愿", "displayUnit": "点", "type": "number", "initial": 55, "minimum": 0, "maximum": 100 }
+  ],
+  "actions": [
+    {
+      "id": "secure_evidence",
+      "name": "封存关键证据",
+      "description": "暂停相关操作，复制审计材料并建立保全记录",
+      "timeCost": 1,
+      "effects": [
+        { "operation": "increment", "target": "evidence", "value": 30 },
+        { "operation": "increment", "target": "regulatory_pressure", "value": 5 }
+      ],
+      "emits": "financial_review_conclusion"
+    },
+    {
+      "id": "conceal_funds",
+      "name": "隐藏关联款项",
+      "description": "暂时转移款项以维持交易，但会破坏证据并显著增加监管风险",
+      "timeCost": 1,
+      "effects": [
+        { "operation": "increment", "target": "liquidity", "value": 20 },
+        { "operation": "decrement", "target": "evidence", "value": 20 },
+        { "operation": "increment", "target": "regulatory_pressure", "value": 25 }
+      ],
+      "emits": "evidence_at_risk"
+    },
+    {
+      "id": "voluntary_disclosure",
+      "name": "主动向监管披露",
+      "description": "提交已经固定的证据，换取调查过程可控",
+      "timeCost": 1,
+      "conditionMode": "all",
+      "conditions": [
+        { "target": "evidence", "operator": "gte", "value": 40 }
+      ],
+      "effects": [
+        { "operation": "increment", "target": "evidence", "value": 10 },
+        { "operation": "decrement", "target": "regulatory_pressure", "value": 15 },
+        { "operation": "decrement", "target": "board_support", "value": 5 }
+      ],
+      "emits": "crisis_resolution"
+    },
+    {
+      "id": "force_transaction",
+      "name": "强行推进资产交易",
+      "description": "不等待调查结束，优先完成交易和资金回笼",
+      "timeCost": 1,
+      "effects": [
+        { "operation": "increment", "target": "liquidity", "value": 30 },
+        { "operation": "decrement", "target": "control", "value": 15 },
+        { "operation": "increment", "target": "regulatory_pressure", "value": 20 },
+        { "operation": "decrement", "target": "board_support", "value": 10 }
+      ],
+      "emits": "dual_pressure"
+    },
+    {
+      "id": "negotiate_board",
+      "name": "与罗重霄交换条件",
+      "description": "拿出部分证据和权限安排，争取董事会继续授权",
+      "timeCost": 1,
+      "conditionMode": "all",
+      "conditions": [
+        { "target": "evidence", "operator": "gte", "value": 30 }
+      ],
+      "effects": [
+        { "operation": "increment", "target": "board_support", "value": 15 },
+        { "operation": "increment", "target": "control", "value": 5 },
+        { "operation": "increment", "target": "regulatory_pressure", "value": 5 }
+      ],
+      "emits": "dual_pressure"
+    },
+    {
+      "id": "accept_oversight",
+      "name": "接受临时监督",
+      "description": "主动让渡部分控制权，换取监管暂缓冻结",
+      "timeCost": 1,
+      "effects": [
+        { "operation": "decrement", "target": "control", "value": 20 },
+        { "operation": "decrement", "target": "regulatory_pressure", "value": 25 },
+        { "operation": "increment", "target": "evidence", "value": 5 }
+      ],
+      "emits": "crisis_resolution"
+    }
+  ],
+  "endings": [
+    { "id": "company_stabilized", "name": "暂时稳住公司", "description": "证据经受审查，公司保留了继续处理危机的空间。" },
+    { "id": "board_ouster", "name": "被董事会架空", "description": "玩家仍在局中，但已失去关键决策权。" },
+    { "id": "regulatory_freeze", "name": "监管冻结行动", "description": "证据或合规失守，监管机构接管了关键行动。" }
+  ],
+  "objectives": [
+    {
+      "id": "secure_key_evidence",
+      "name": "固定关键证据",
+      "description": "把证据完整度提高到45以上，避免事实继续流失。",
+      "kind": "main",
+      "issuerCharacterId": "director",
+      "startsActive": true,
+      "deadlineTurns": 4,
+      "promiseText": "在四回合内固定关键付款证据",
+      "conditionMode": "all",
+      "conditions": [
+        { "target": "evidence", "operator": "gte", "value": 45 }
+      ],
+      "failureConditionMode": "all",
+      "failureConditions": [
+        { "target": "evidence", "operator": "lte", "value": 5 }
+      ],
+      "failedEffects": [
+        { "operation": "increment", "target": "regulatory_pressure", "value": 15 }
+      ]
+    },
+    {
+      "id": "obtain_board_mandate",
+      "name": "稳住董事会授权",
+      "description": "在证据固定后，把董事会支持提高到65以上。",
+      "kind": "main",
+      "issuerCharacterId": "board_rival",
+      "dependsOn": ["secure_key_evidence"],
+      "deadlineTurns": 2,
+      "promiseText": "证据固定后，在两回合内拿到董事会继续处置危机的授权",
+      "conditionMode": "all",
+      "conditions": [
+        { "target": "board_support", "operator": "gte", "value": 65 }
+      ],
+      "failureConditionMode": "all",
+      "failureConditions": [
+        { "target": "board_support", "operator": "lte", "value": 20 }
+      ],
+      "failedEffects": [
+        { "operation": "decrement", "target": "control", "value": 20 }
+      ]
+    },
+    {
+      "id": "prepare_regulatory_response",
+      "name": "准备监管说明",
+      "description": "让证据完整度达到60，并把监管压力降到35以下。",
+      "kind": "optional",
+      "issuerCharacterId": "legal",
+      "startsActive": false,
+      "deadlineTurns": 2,
+      "promiseText": "接受任务后，在两回合内准备一份证据充分的监管说明",
+      "conditionMode": "all",
+      "conditions": [
+        { "target": "evidence", "operator": "gte", "value": 60 },
+        { "target": "regulatory_pressure", "operator": "lte", "value": 35 }
+      ],
+      "failureConditionMode": "all",
+      "failureConditions": [
+        { "target": "regulatory_pressure", "operator": "gte", "value": 80 }
+      ],
+      "failedEffects": [
+        { "operation": "decrement", "target": "control", "value": 10 }
+      ]
+    }
+  ],
+  "npcs": [
+    {
+      "id": "director",
+      "agentId": 1001,
+      "displayName": "闻峥",
+      "role": "危机总指挥",
+      "responsibilities": "控制叙事节奏、召集关键人物、呈现规则已经结算的后果；不能替玩家或NPC做决定。",
+      "characterType": "director",
+      "visibleMetricIds": ["liquidity", "control", "evidence", "regulatory_pressure", "board_support"],
+      "knownInformation": ["付款异常已经进入内部核查", "董事会和监管都在等待第一份可信说明"],
+      "informationScope": "全局局势与已经发生的事实",
+      "permissions": ["advance_turn"]
+    },
+    {
+      "id": "finance",
+      "agentId": 1002,
+      "displayName": "莫云岑",
+      "role": "首席财务官",
+      "responsibilities": "确认资金路径、评估流动性、执行获准的财务行动。",
+      "characterType": "npc",
+      "visibleMetricIds": ["liquidity", "evidence", "regulatory_pressure"],
+      "executableActionIds": ["secure_evidence", "conceal_funds", "force_transaction"],
+      "advisoryActionIds": ["voluntary_disclosure", "accept_oversight"],
+      "knownInformation": ["异常款项来自一个没有出现在董事会简报中的关联账户", "强行交易能缓解现金问题，但会留下新的核查痕迹"],
+      "informationScope": "财务账目、付款指令与资金路径",
+      "permissions": ["propose", "execute"]
+    },
+    {
+      "id": "legal",
+      "agentId": 1003,
+      "displayName": "谢衡",
+      "role": "总法律顾问",
+      "responsibilities": "判断披露义务、保护证据链并提出合规方案。",
+      "characterType": "npc",
+      "visibleMetricIds": ["control", "evidence", "regulatory_pressure"],
+      "executableActionIds": ["voluntary_disclosure", "accept_oversight"],
+      "advisoryActionIds": ["secure_evidence", "negotiate_board"],
+      "knownInformation": ["监管尚未正式立案，但已发出非正式问询", "证据链完整时可以争取主动披露安排"],
+      "informationScope": "法律风险、监管沟通与证据保全",
+      "permissions": ["propose", "execute", "offer_objective"]
+    },
+    {
+      "id": "board_rival",
+      "agentId": 1004,
+      "displayName": "罗重霄",
+      "role": "董事会对手",
+      "responsibilities": "保护董事会控制与公司连续性，并在玩家失去可信度时推动替代方案。",
+      "characterType": "npc",
+      "visibleMetricIds": ["control", "board_support", "regulatory_pressure"],
+      "executableActionIds": ["negotiate_board"],
+      "advisoryActionIds": ["force_transaction", "accept_oversight"],
+      "knownInformation": ["部分董事准备在下一次会议提出临时授权方案", "他愿意交换条件，但不会接受没有证据的口头保证"],
+      "informationScope": "董事会立场、授权与治理安排",
+      "permissions": ["propose", "offer_objective"]
+    }
+  ],
+  "events": [
+    {
+      "sceneId": "crisis_office",
+      "id": "payment_anomaly_found",
+      "name": "付款异常被发现",
+      "description": "雨夜十一点四十分，财务系统发现一笔未进入董事会简报的四千七百万关联付款。",
+      "category": "system",
+      "displayContent": "23:40，暴雨压住了城市的灯。审计系统突然标红一笔四千七百万的关联付款；莫云岑带着打印件推门进来，却没有解释她为何比系统更早知道这笔钱。",
+      "conditionMode": "all",
+      "conditions": [{ "target": "evidence", "operator": "eq", "value": 20 }],
+      "participantCharacterIds": ["director", "finance"],
+      "effects": [{ "operation": "increment", "target": "regulatory_pressure", "value": 5 }],
+      "advancesTime": true,
+      "timeAdvance": 1,
+      "priority": 100,
+      "once": true,
+      "exclusiveGroup": "core_progress",
+      "nextEventIds": ["evidence_at_risk"]
+    },
+    {
+      "sceneId": "evidence_room",
+      "id": "evidence_at_risk",
+      "name": "关键证据可能被销毁",
+      "description": "凌晨两点的自动归档将覆盖与异常付款有关的原始记录。",
+      "category": "route",
+      "displayContent": "距离自动归档只剩九十分钟。机房值班员拒绝口头停机，谢衡要求你留下正式指令；莫云岑则提醒，暂停系统会让正在进行的交易立刻暴露。",
+      "conditionMode": "all",
+      "conditions": [
+        { "target": "regulatory_pressure", "operator": "gte", "value": 30 },
+        { "target": "evidence", "operator": "lt", "value": 45 }
+      ],
+      "participantCharacterIds": ["finance", "legal"],
+      "effects": [{ "operation": "decrement", "target": "evidence", "value": 5 }],
+      "advancesTime": true,
+      "timeAdvance": 1,
+      "priority": 90,
+      "once": true,
+      "exclusiveGroup": "core_progress",
+      "nextEventIds": ["financial_review_conclusion"]
+    },
+    {
+      "sceneId": "finance_war_room",
+      "id": "financial_review_conclusion",
+      "name": "财务调查给出结论",
+      "description": "保全的记录指向一个由高层控制的影子账户，莫云岑必须解释她隐瞒的部分。",
+      "category": "route",
+      "displayContent": "凌晨三点十二分，资金路径终于拼完整：款项绕过了正常审批，并在三家公司之间折返。莫云岑承认她两周前就发现异常，但她说自己是在等一个不会让公司立刻断粮的时机。",
+      "conditionMode": "all",
+      "conditions": [{ "target": "evidence", "operator": "gte", "value": 45 }],
+      "participantCharacterIds": ["director", "finance", "legal"],
+      "effects": [{ "operation": "increment", "target": "evidence", "value": 5 }],
+      "advancesTime": true,
+      "timeAdvance": 1,
+      "priority": 80,
+      "once": true,
+      "exclusiveGroup": "core_progress",
+      "nextEventIds": ["dual_pressure"]
+    },
+    {
+      "sceneId": "boardroom",
+      "id": "dual_pressure",
+      "name": "监管与董事会同时施压",
+      "description": "清晨八点半，董事会准备收回你的危机授权，监管问询也要求九点前答复。",
+      "category": "system",
+      "displayContent": "会议室门在身后合上。罗重霄把临时治理议案推到桌上：交出一部分控制权，他就替你争取四十八小时；与此同时，谢衡的手机亮起，监管要求九点前收到第一份正式说明。",
+      "conditionMode": "any",
+      "conditions": [
+        { "target": "regulatory_pressure", "operator": "gte", "value": 50 },
+        { "target": "board_support", "operator": "lte", "value": 40 }
+      ],
+      "participantCharacterIds": ["director", "legal", "board_rival"],
+      "effects": [{ "operation": "decrement", "target": "control", "value": 10 }],
+      "advancesTime": true,
+      "timeAdvance": 1,
+      "priority": 70,
+      "once": true,
+      "exclusiveGroup": "core_progress",
+      "nextEventIds": ["crisis_resolution"]
+    },
+    {
+      "sceneId": "regulatory_room",
+      "id": "crisis_resolution",
+      "name": "危机进入收束",
+      "description": "上午九点，所有承诺都要变成可核验的文件，此前的选择开始兑现。",
+      "category": "route",
+      "displayContent": "九点整，监管代表翻开你提交的材料。莫云岑、谢衡和罗重霄坐在不同方向，没有人再替你补充解释。你此前保住或牺牲的东西，将决定这场会谈由谁掌控。",
+      "conditionMode": "any",
+      "conditions": [
+        { "target": "evidence", "operator": "gte", "value": 60 },
+        { "target": "control", "operator": "lte", "value": 30 },
+        { "target": "regulatory_pressure", "operator": "gte", "value": 70 }
+      ],
+      "participantCharacterIds": ["director", "finance", "legal", "board_rival"],
+      "advancesTime": true,
+      "timeAdvance": 1,
+      "priority": 60,
+      "once": true,
+      "exclusiveGroup": "core_progress",
+      "nextEventIds": ["ending_regulatory_freeze", "ending_board_ouster", "ending_company_stabilized"]
+    },
+    {
+      "sceneId": "regulatory_room",
+      "id": "ending_regulatory_freeze",
+      "name": "结局：监管冻结行动",
+      "category": "route",
+      "displayContent": "监管机构冻结了关键账户和处置权限。公司进入外部接管程序。",
+      "conditionMode": "any",
+      "conditions": [
+        { "target": "regulatory_pressure", "operator": "gte", "value": 80 },
+        { "target": "evidence", "operator": "lte", "value": 5 }
+      ],
+      "participantCharacterIds": ["director", "legal"],
+      "priority": 100,
+      "once": true,
+      "exclusiveGroup": "final_ending",
+      "endGame": true,
+      "endReason": "regulatory_freeze"
+    },
+    {
+      "sceneId": "boardroom",
+      "id": "ending_board_ouster",
+      "name": "结局：被董事会架空",
+      "category": "route",
+      "displayContent": "董事会通过临时治理方案。罗重霄接过执行权，你被排除在关键决策之外。",
+      "conditionMode": "any",
+      "conditions": [
+        { "target": "control", "operator": "lte", "value": 20 },
+        { "target": "board_support", "operator": "lte", "value": 20 }
+      ],
+      "participantCharacterIds": ["director", "board_rival"],
+      "priority": 90,
+      "once": true,
+      "exclusiveGroup": "final_ending",
+      "endGame": true,
+      "endReason": "board_ouster"
+    },
+    {
+      "sceneId": "regulatory_room",
+      "id": "ending_company_stabilized",
+      "name": "结局：暂时稳住公司",
+      "category": "route",
+      "displayContent": "证据经受住第一轮审查，董事会保留你的危机处置授权。公司获得了有限的喘息时间。",
+      "conditionMode": "all",
+      "conditions": [
+        { "target": "evidence", "operator": "gte", "value": 65 },
+        { "target": "regulatory_pressure", "operator": "lte", "value": 35 },
+        { "target": "control", "operator": "gte", "value": 35 }
+      ],
+      "participantCharacterIds": ["director", "finance", "legal", "board_rival"],
+      "priority": 80,
+      "once": true,
+      "exclusiveGroup": "final_ending",
+      "endGame": true,
+      "endReason": "company_stabilized"
+    }
+  ],
+  "scenes": [
+    {
+      "id": "crisis_office",
+      "name": "雨夜办公室",
+      "description": "23:40，顶层办公室外是暴雨和城市灯海。异常付款警报在这里打破平静，玩家第一次面对莫云岑。",
+      "order": 1,
+      "backgroundRef": "asset://speeding-p0/background/crisis-office-rain",
+      "portraitRefs": {
+        "finance": "asset://speeding-p0/portrait/finance-neutral"
+      },
+      "characters": [
+        { "id": "office-finance", "characterId": "finance", "x": 68, "y": 0, "scale": 1, "layer": 2, "visible": true }
+      ],
+      "musicRef": "asset://speeding-p0/music/rain-opening",
+      "soundEffectRefs": ["asset://speeding-p0/sfx/rain-window", "asset://speeding-p0/sfx/system-alert"]
+    },
+    {
+      "id": "evidence_room",
+      "name": "证据封存室",
+      "description": "冷白灯、封存箱和不断刷新的审计屏幕。用于付款异常、证据保全和财务调查。",
+      "order": 2,
+      "backgroundRef": "asset://speeding-p0/background/evidence-room",
+      "portraitRefs": {
+        "finance": "asset://speeding-p0/portrait/finance-neutral",
+        "legal": "asset://speeding-p0/portrait/legal-neutral"
+      },
+      "characters": [
+        { "id": "evidence-finance", "characterId": "finance", "x": 35, "y": 0, "scale": 1, "layer": 2, "visible": true },
+        { "id": "evidence-legal", "characterId": "legal", "x": 72, "y": 0, "scale": 1, "layer": 3, "visible": true }
+      ],
+      "musicRef": "asset://speeding-p0/music/investigation",
+      "soundEffectRefs": ["asset://speeding-p0/sfx/archive-lock", "asset://speeding-p0/sfx/system-alert"]
+    },
+    {
+      "id": "finance_war_room",
+      "name": "财务作战室",
+      "description": "凌晨三点，桌面铺满付款指令、账户关系图和冷掉的咖啡。调查结论与莫云岑隐瞒的事实都在这里揭开。",
+      "order": 3,
+      "backgroundRef": "asset://speeding-p0/background/finance-war-room",
+      "portraitRefs": {
+        "finance": "asset://speeding-p0/portrait/finance-tense",
+        "legal": "asset://speeding-p0/portrait/legal-neutral"
+      },
+      "characters": [
+        { "id": "war-room-finance", "characterId": "finance", "x": 32, "y": 0, "scale": 1, "layer": 3, "visible": true },
+        { "id": "war-room-legal", "characterId": "legal", "x": 72, "y": 0, "scale": 1, "layer": 2, "visible": true }
+      ],
+      "musicRef": "asset://speeding-p0/music/investigation-reveal",
+      "soundEffectRefs": ["asset://speeding-p0/sfx/document-place", "asset://speeding-p0/sfx/phone-vibrate"]
+    },
+    {
+      "id": "boardroom",
+      "name": "董事会议室",
+      "description": "夜间会议室，城市灯光映在长桌上。用于授权争夺和与罗重霄谈判。",
+      "order": 4,
+      "backgroundRef": "asset://speeding-p0/background/boardroom",
+      "portraitRefs": {
+        "board_rival": "asset://speeding-p0/portrait/board-rival-neutral",
+        "legal": "asset://speeding-p0/portrait/legal-tense"
+      },
+      "characters": [
+        { "id": "board-legal", "characterId": "legal", "x": 30, "y": 0, "scale": 0.95, "layer": 2, "visible": true },
+        { "id": "board-rival", "characterId": "board_rival", "x": 72, "y": 0, "scale": 1.05, "layer": 3, "visible": true }
+      ],
+      "musicRef": "asset://speeding-p0/music/crisis",
+      "soundEffectRefs": ["asset://speeding-p0/sfx/door-close", "asset://speeding-p0/sfx/vote-confirm"]
+    },
+    {
+      "id": "regulatory_room",
+      "name": "监管会谈室",
+      "description": "没有装饰的正式会谈空间。用于披露、监督安排和最终结局。",
+      "order": 5,
+      "backgroundRef": "asset://speeding-p0/background/regulatory-room",
+      "portraitRefs": {
+        "finance": "asset://speeding-p0/portrait/finance-tense",
+        "legal": "asset://speeding-p0/portrait/legal-confrontational",
+        "board_rival": "asset://speeding-p0/portrait/board-rival-confrontational"
+      },
+      "characters": [
+        { "id": "regulatory-finance", "characterId": "finance", "x": 20, "y": 0, "scale": 0.9, "layer": 1, "visible": true },
+        { "id": "regulatory-legal", "characterId": "legal", "x": 50, "y": 0, "scale": 1, "layer": 3, "visible": true },
+        { "id": "regulatory-rival", "characterId": "board_rival", "x": 78, "y": 0, "scale": 0.9, "layer": 2, "visible": true }
+      ],
+      "musicRef": "asset://speeding-p0/music/resolution",
+      "soundEffectRefs": ["asset://speeding-p0/sfx/document-place", "asset://speeding-p0/sfx/ending-sting"]
+    }
+  ]
+}

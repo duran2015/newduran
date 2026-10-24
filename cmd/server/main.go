@@ -1,0 +1,1110 @@
+package main
+
+import (
+	"context"
+	"embed"
+	"io/fs"
+	"log"
+	"net/http"
+	"os/signal"
+	"runtime/debug"
+	"strings"
+	"syscall"
+	"time"
+
+	"control-panel/internal/application/services"
+	"control-panel/internal/auth"
+	"control-panel/internal/auth/builtin"
+	"control-panel/internal/auth/jwtutil"
+	"control-panel/internal/config"
+	"control-panel/internal/directory"
+	authdom "control-panel/internal/domain/auth"
+	eventdomain "control-panel/internal/domain/event"
+	knowledgedomain "control-panel/internal/domain/knowledge"
+	"control-panel/internal/domain/provider"
+	"control-panel/internal/domain/systemsetting"
+	"control-panel/internal/handler"
+	"control-panel/internal/infrastructure/deployer"
+	knowledgeinfra "control-panel/internal/infrastructure/knowledge"
+	"control-panel/internal/infrastructure/kong"
+	"control-panel/internal/infrastructure/multirag"
+	ossinfra "control-panel/internal/infrastructure/oss"
+	repository "control-panel/internal/infrastructure/persistence"
+	"control-panel/internal/infrastructure/runtime"
+	"control-panel/internal/middleware"
+	"control-panel/pkg/database"
+
+	"github.com/gin-gonic/gin"
+)
+
+// SPAFileSystem implements http.FileSystem with SPA fallback: serves index.html
+// when the requested file is not found.
+type SPAFileSystem struct {
+	http.FileSystem
+}
+
+func (sfs *SPAFileSystem) Open(name string) (http.File, error) {
+	f, err := sfs.FileSystem.Open(name)
+	if err != nil {
+		return sfs.FileSystem.Open("index.html")
+	}
+	return f, nil
+}
+
+//go:embed all:dist
+var staticFiles embed.FS
+
+// staticCacheHeaders sets Cache-Control for the embedded SPA. Vite emits
+// content-hashed assets under /static/assets/ (safe to cache forever); the
+// entry index.html and SPA client routes keep their URLs across releases and
+// must always revalidate. The embed FS carries no Last-Modified/ETag
+// validators, and browsers apply heuristic caching when no explicit policy is
+// sent — without these headers, users keep running stale JS after upgrades.
+func staticCacheHeaders(c *gin.Context) {
+	p := c.Request.URL.Path
+	// /static/h5/assets/ 为移动端 h5 的 content-hashed 资源，同 frontend
+	if strings.HasPrefix(p, "/static/assets/") || strings.HasPrefix(p, "/static/h5/assets/") {
+		c.Header("Cache-Control", "public, max-age=31536000, immutable")
+	} else if p == "/static" || strings.HasPrefix(p, "/static/") {
+		c.Header("Cache-Control", "no-cache")
+	}
+	// 相邻前缀路径（/staticity、/static-old 等）不属于 SPA 静态区，不动头
+	c.Next()
+}
+
+func main() {
+	cfg, err := config.LoadConfig()
+	if err != nil {
+		log.Fatalf("Failed to load config: %v", err)
+	}
+
+	if err := database.InitDatabase(&cfg.Database); err != nil {
+		log.Fatalf("Failed to initialize database: %v", err)
+	}
+	defer database.Close()
+
+	// 回填租户：builtin 恒 default；casdoor 模式取 CASDOOR_ORGANIZATION
+	// （可选）——未配置时 AutoMigrate 从 user_identities 自动推断（单租户
+	// 部署零配置升级）；仅在存量数据无法归属时才要求一次性显式配置。
+	backfill := "default"
+	if !cfg.Auth.IsBuiltin() {
+		backfill = strings.TrimSpace(cfg.Casdoor.Organization)
+	}
+	if err := database.AutoMigrate(backfill); err != nil {
+		log.Fatalf("Failed to auto migrate database: %v", err)
+	}
+
+	// 一次性数据归一：旧模型升级后，存量行 {role:旧快照, status:pending} 与
+	// 新模型语义矛盾（pending 用户仍持有旧角色权限）。此处清空 pending 行的
+	// role，使升级后全员待审批、由 admin 重新分配。幂等（新模型 pending 行
+	// role 恒为 ""），builtin 模式下 user_identities 表无数据、执行无副作用。
+	if err := auth.NormalizePendingRoles(database.GetDB()); err != nil {
+		log.Fatalf("Failed to normalize pending roles: %v", err)
+	}
+
+	// builtin 模式下未显式配置 AUTH_JWT_SECRET 时，自动生成随机 secret 并
+	// 持久化到数据库（system_settings 表）：重启、容器重建、镜像升级均
+	// 不丢失，登录态保持。显式配置时原样使用（不写库）。
+	if cfg.Auth.IsBuiltin() && cfg.Auth.JWTSecret == "" {
+		secret, err := systemsetting.EnsureJWTSecret(database.GetDB(), cfg.Auth.JWTSecret)
+		if err != nil {
+			log.Fatalf("Failed to provision JWT secret: %v", err)
+		}
+		cfg.Auth.JWTSecret = secret
+		log.Println("Auth: JWT secret auto-provisioned and persisted in the database (set AUTH_JWT_SECRET explicitly to override)")
+	}
+
+	if err := cfg.ValidateAuth(); err != nil {
+		log.Fatalf("Invalid auth config: %v", err)
+	}
+
+	// Knowledge capability secret（issue #111 重开修复）：per-agent capability
+	// 的签名 secret，与 provider 凭证加密密钥（PROVIDER_ENCRYPTION_KEY）解耦
+	// 的独立安全关注点。Ensure 模式（与 AUTH_JWT_SECRET 对称）：显式配置
+	// KNOWLEDGE_CAPABILITY_SECRET 时原样使用不写库；未配置时生成随机 secret
+	// 持久化到 system_settings（空 provider 密钥环境下 knowledge MCP 部署
+	// 不再被拦截）。签发侧（AgentDeployerService）与验证侧（AgentService）
+	// 必须同源同值——此处一次 Ensure、两处注入。
+	capabilitySecret, err := systemsetting.EnsureKnowledgeCapabilitySecret(database.GetDB(), cfg.Knowledge.CapabilitySecret)
+	if err != nil {
+		log.Fatalf("Failed to provision knowledge capability secret: %v", err)
+	}
+	if cfg.Knowledge.CapabilitySecret == "" {
+		log.Println("Knowledge: capability secret auto-provisioned and persisted in the database (set KNOWLEDGE_CAPABILITY_SECRET explicitly to override)")
+	}
+
+	// ==================== 认证装配（按 auth.mode 二选一） ====================
+	var authProvider auth.Provider
+	var casdoorProvider *auth.CasdoorProvider
+	var casdoorDir *directory.CasdoorDirectory
+	var casdoorUserHandler *handler.CasdoorUserHandler
+	var builtinAuthHandler *handler.BuiltinAuthHandler
+	var adminUserHandler *handler.AdminUserHandler
+
+	// 审计写入侧（Task 10）：auth 端点埋点在两种模式下都消费 recorder，须先于
+	// 认证装配创建；查询侧（auditQuerier）在下方 Audit 领域区复用同一 repo。
+	auditRepo := repository.NewAuditRepository(database.GetDB())
+	auditRecorder := services.NewAuditRecorder(auditRepo)
+
+	if cfg.Auth.IsBuiltin() {
+		userSvc := services.NewUserService(database.GetDB())
+		inviteSvc := services.NewInviteService(database.GetDB())
+		builtinProvider := builtin.New(database.GetDB(), cfg.Auth.JWTSecret)
+		authProvider = builtinProvider
+		builtinAuthHandler = handler.NewBuiltinAuthHandler(builtinProvider, userSvc, inviteSvc, auditRecorder)
+		adminUserHandler = handler.NewAdminUserHandler(userSvc, inviteSvc, builtinProvider, auditRecorder)
+		log.Println("Auth mode: builtin")
+	} else {
+		if err := auth.InitCasdoor(&cfg.Casdoor); err != nil {
+			log.Fatalf("Failed to initialize Casdoor: %v", err)
+		}
+		// membershipStore 是 user_identities 的唯一句柄：provider（登录时合成
+		// 角色）与 directory（用户管理 CRUD）共享同一实例。
+		membershipStore := auth.NewMembershipStore(database.GetDB())
+		casdoorProvider = auth.NewCasdoorProvider(membershipStore)
+		authProvider = casdoorProvider
+		// directory 按请求租户解析 casdoor client（多租户：每个组织独立 API 作用域）。
+		casdoorDir = directory.NewCasdoorDirectory(func(org string) directory.UserClient {
+			return auth.ClientForOrg(org)
+		}, membershipStore)
+		// 登录链接按请求租户生成 OAuth 授权 URL（各 org 解析自己的
+		// tenant_oauth_clients 凭证），这里注入生成函数。
+		casdoorUserHandler = handler.NewCasdoorUserHandler(casdoorDir, auth.GenerateLoginURL, auditRecorder)
+		log.Println("Auth mode: casdoor")
+	}
+
+	// OSS is optional: when unconfigured (empty endpoint) the server runs
+	// without file-upload support (InitOSS returns nil) rather than refusing
+	// to boot. Configured-but-invalid OSS still fails fast.
+	uploader, err := ossinfra.InitOSS(&cfg.OSS)
+	if err != nil {
+		log.Fatalf("Failed to initialize OSS: %v", err)
+	}
+	if uploader == nil {
+		log.Println("OSS not configured — file uploads disabled (set OSS_ENDPOINT/BUCKET/REGION to enable)")
+	}
+
+	r := gin.Default()
+	r.MaxMultipartMemory = 50 << 20
+
+	// 审计 RemoteIP 信任边界（spec §5.2）：非法 CIDR 即终止启动——错误配置后的
+	// 信任状态不可保证；fatal 属内部错误，按 CONTRIBUTING 带 stack。
+	if err := middleware.ApplyTrustedProxies(r, cfg.Server.TrustedProxies); err != nil {
+		log.Fatalf("invalid server.trusted_proxies config: %v\n%s", err, debug.Stack())
+	}
+
+	r.Use(middleware.Logger())
+	r.Use(middleware.Recovery())
+	r.Use(middleware.CORS(cfg.Server.CorsOrigins))
+	r.Use(staticCacheHeaders)
+
+	// 静态资源管理
+	dist, err := fs.Sub(staticFiles, "dist")
+	if err != nil {
+		log.Fatalf("Failed to load static files: %v", err)
+	}
+	r.StaticFS("/static", &SPAFileSystem{http.FS(dist)})
+
+	// ==================== 处理器初始化 ====================
+
+	deployerClient := deployer.NewClient(cfg.Deployer.URL, cfg.Deployer.APIKey)
+
+	// Kong gateway setup. KongClient is nil when AdminURL is empty, making the
+	// entire gateway integration a no-op.
+	kongClient := kong.NewClient(cfg.Kong.AdminURL)
+	kongService := services.NewKongGatewayService(
+		kongClient,
+		cfg.Deployer.UpstreamHost,
+		cfg.Deployer.PublicHost,
+		repository.NewAgentRepository(),
+		cfg.Kong.ReconcileSec,
+		services.AuthModeFromConfig(cfg.Auth.IsBuiltin()),
+	)
+
+	var knowledgeEngine knowledgedomain.KnowledgeEngine
+	if cfg.Knowledge.MultiragBaseURL != "" && cfg.Knowledge.MultiragAPIKey != "" {
+		knowledgeEngine = knowledgeinfra.NewRemoteMultiragEngine(
+			cfg.Knowledge.MultiragBaseURL,
+			cfg.Knowledge.MultiragAPIKey,
+			time.Duration(cfg.Knowledge.TimeoutSeconds)*time.Second,
+			time.Duration(cfg.Knowledge.UploadTimeoutSeconds)*time.Second,
+		)
+	}
+	// ProviderService is constructed before KnowledgeService so the latter
+	// can translate local model_ids (e.g. "bge-large-zh") into MultiRAG
+	// full-ID format ("bge-large-zh@ZHIPU-AI") before forwarding.
+	providerService := services.NewProviderService(cfg.Provider.EncryptionKey)
+	knowledgeService := services.NewKnowledgeService(knowledgeEngine, providerService)
+
+	aigcConfigSvc := services.NewAigcConfigService(database.GetDB(), cfg.Provider.EncryptionKey, repository.NewProviderRepository())
+	aigcConfigHandler := handler.NewAigcConfigHandler(aigcConfigSvc, auditRecorder)
+	deployerService := services.NewAgentDeployerService(services.AgentDeployerConfig{
+		Client:            deployerClient,
+		PublicHost:        cfg.Deployer.PublicHost,
+		UpstreamHost:      cfg.Deployer.UpstreamHost,
+		CDNHost:           cfg.OSS.CDNHost,
+		EncryptionKey:     cfg.Provider.EncryptionKey,
+		RuntimeAPIKey:     cfg.Deployer.RuntimeAPIKey,
+		CapabilitySecret:  capabilitySecret, // knowledge capability 签发 secret（与 encryptionKey 解耦，两侧同源）
+		KnowledgeSvc:      knowledgeService,
+		KongSvc:           kongService,
+		AigcSvc:           aigcConfigSvc,
+		ChatPushAPIKey:    cfg.ChatPush.APIKey,
+		ChatPushPublicURL: cfg.ChatPush.PublicURL,
+		AuthMode:          services.AuthModeFromConfig(cfg.Auth.IsBuiltin()),
+	})
+
+	agentService := services.NewAgentService(cfg.Provider.EncryptionKey, capabilitySecret)
+	agentHandler := handler.NewAgentHandler(agentService, deployerService, auditRecorder)
+
+	// Agent chat: sessions + messages + SSE streaming proxy to runtime
+	runtimeClient := runtime.NewClient()
+	agentChatSvc := services.NewAgentChatService(
+		repository.NewChatRepository(),
+		repository.NewAgentRepository(),
+		deployerService,
+		runtimeClient,
+		cfg.Deployer.PublicHost,
+		cfg.Deployer.RuntimeAPIKey,
+		cfg.Deployer.UpstreamHost,
+	)
+	runService := services.NewRunService(database.GetDB())
+	extensionLifecycleService := services.NewExtensionLifecycleService(database.GetDB())
+	// H7.4 授权服务必须在种子之前就位：EnsureBuiltinPersonaPacks 会把
+	// manifest 声明的权限同步成 grants 行（syncGrantsWithTx），而该方法在
+	// authz 为 nil 时是 no-op。此前种子跑在 SetAuthzService 之前，导致四个
+	// 内置扩展永远没有 grants，与本文件早先"授权同步与种子同事务"的注释不符。
+	extensionAuthzService := services.NewExtensionAuthzService(database.GetDB())
+	extensionLifecycleService.SetAuthzService(extensionAuthzService)
+	// H7.4（P0）扩展身份认证服务：签发/校验扩展凭据。
+	extensionIdentityService := services.NewExtensionIdentityService(database.GetDB())
+	// H7 P1：四个人物能力注册为 default 租户的内置扩展（默认已安装+启用），
+	// 之后所有生效路径经 PersonaCapabilityGate 运行时查询，管理员停用立即
+	// 生效且无需重启。种子幂等；失败必须中断启动（否则能力被静默关闭）。
+	if err := extensionLifecycleService.EnsureBuiltinPersonaPacks(); err != nil {
+		log.Fatalf("Failed to ensure builtin persona packs: %v", err)
+	}
+	// H6 Run binding: expose the same four persona abilities as immutable,
+	// selectable capability packages. Extension installation controls whether
+	// code is available; a Run binding controls whether that Run may use it.
+	if err := services.NewCapabilityRegistryService(database.GetDB()).EnsureBuiltinPersonaCapabilities(); err != nil {
+		log.Fatalf("Failed to ensure builtin persona capability packages: %v", err)
+	}
+	// P0-3 启动期断言：种子必须真正落地 grants 行。syncGrantsWithTx 在 authz
+	// 未接线时是静默 no-op，而"把 SetAuthzService 放在种子之前"只是一句注释，
+	// 挡不住下一次重排——这里显式验证，把静默失效变成启动失败。
+	for _, packName := range services.BuiltinPersonaPackNames() {
+		count, err := extensionAuthzService.CountGrants(services.BuiltinPersonaPackTenant, packName)
+		if err != nil {
+			log.Fatalf("Failed to verify grants for builtin extension %s: %v", packName, err)
+		}
+		if count == 0 {
+			log.Fatalf("Builtin extension %s has no grants after seeding: extensionAuthzService must be wired before EnsureBuiltinPersonaPacks", packName)
+		}
+	}
+	personaGate := services.NewPersonaCapabilityGate(database.GetDB())
+	// H6 persona capability packs (WS6 wiring): all state lives in RunState;
+	// EnsureSchemas is idempotent and failures are non-fatal (log warning).
+	// 状态 Schema 只在对应内置扩展仍启用时确保；四个全停则整段跳过。
+	emotionService := services.NewEmotionService(runService)
+	beliefService := services.NewBeliefService(runService)
+	memoryService := services.NewMemoryService(runService)
+	relationDynamicsService := services.NewRelationDynamicsService(runService)
+	for name, svc := range map[string]func() error{
+		"emotion":               emotionService.EnsureSchemas,
+		"belief":                beliefService.EnsureSchemas,
+		"memory":                memoryService.EnsureSchemas,
+		"relationship-dynamics": relationDynamicsService.EnsureSchemas,
+	} {
+		if !personaGate.Enabled("default", name) {
+			log.Printf("H6 %s capability disabled via extension lifecycle; skipping schema ensure", name)
+			continue
+		}
+		if err := svc(); err != nil {
+			log.Printf("Warning: H6 %s schema ensure failed: %v", name, err)
+		}
+	}
+	eventService := services.NewEventService(database.GetDB())
+	eventHandler := handler.NewEventHandler(eventService)
+	promptComposerService := services.NewPromptComposerService(database.GetDB())
+	// H6 WS5/WS6: recent_memory 阶段从主观记忆包检索该 Agent 的前 5 条记忆。
+	// Provider 出错时合成器会跳过该阶段，这里再包一层防御。
+	// H7 P1：经 PersonaCapabilityGate 包装，主观记忆扩展被停用时闭包返回
+	// 空结果，合成器跳过该阶段；gate 在闭包内运行时查询，停用立即生效。
+	promptComposerService.SetRecentMemoryProvider(personaGate.GateRecentMemoryProvider(func(tenantID, runID string, agentID uint64) ([]services.RecentMemoryItem, error) {
+		entries, err := memoryService.Recall(tenantID, runID, agentID, "", 5, time.Now().UTC())
+		if err != nil {
+			return nil, err
+		}
+		items := make([]services.RecentMemoryItem, 0, len(entries))
+		for i := range entries {
+			items = append(items, services.RecentMemoryItem{
+				Label: entries[i].FactRef,
+				Text:  entries[i].Interpretation,
+			})
+		}
+		return items, nil
+	}))
+	promptComposerHandler := handler.NewPromptComposerHandler(promptComposerService)
+	toolResultHandler := handler.NewToolResultHandler(services.NewToolResultService(database.GetDB()))
+	agentChatHandler := handler.NewAgentChatHandler(agentChatSvc, runService)
+	agentChatHandler.SetPromptComposer(promptComposerService)
+	agentDetailHandler := handler.NewAgentDetailHandler(agentChatSvc)
+	agentFilesHandler := handler.NewAgentFilesHandler(agentChatSvc)
+
+	toolService := services.NewToolService(uploader)
+	toolHandler := handler.NewToolHandler(toolService)
+
+	skillService := services.NewSkillService(uploader, cfg.OSS.CDNHost)
+	skillHandler := handler.NewSkillHandler(skillService)
+
+	sceneService := services.NewSceneService()
+	sceneHandler := handler.NewSceneHandler(sceneService)
+	personalityService := services.NewPersonalityService()
+	personalityHandler := handler.NewPersonalityHandler(personalityService)
+	extensionVerificationHandler := handler.NewExtensionVerificationHandler()
+	relationTypeHandler := handler.NewRelationTypeHandler(services.NewRelationTypeService())
+	agentRelationService := services.NewAgentRelationService()
+	agentRelationHandler := handler.NewAgentRelationHandler(agentRelationService)
+	runHandler := handler.NewRunHandler(runService)
+	capabilityRegistryHandler := handler.NewCapabilityRegistryHandler(services.NewCapabilityRegistryService(database.GetDB()))
+	extensionService := services.NewExtensionService(database.GetDB())
+	extensionAdminHandler := handler.NewExtensionAdminHandlerWithLifecycle(extensionService, extensionLifecycleService)
+	gamePackageService := services.NewGamePackageService(database.GetDB())
+	gamePackageHandler := handler.NewGamePackageHandler(gamePackageService)
+	gameProjectService := services.NewGameProjectService(database.GetDB(), gamePackageService)
+	gameProjectHandler := handler.NewGameProjectHandler(gameProjectService)
+	gameAssetHandler := handler.NewGameAssetHandler(services.NewGameAssetService(database.GetDB(), uploader, cfg.Server.GameAssetDir))
+	gameSessionService := services.NewGameSessionService(database.GetDB(), gameProjectService, runService)
+	gameSessionHandler := handler.NewGameSessionHandler(gameSessionService)
+	gamePlayerService := services.NewGamePlayerSessionService(database.GetDB(), gameProjectService, gamePackageService, gameSessionService, runService)
+	gamePlayerService.SetActionModelFactory(func(tenantID string) services.GameActionLanguageModel {
+		return services.NewProviderGameActionModel(providerService, tenantID)
+	})
+	gameDirectorBridge := services.NewGameDirectorBridge(database.GetDB(), services.NewGameAgentModelRunner(database.GetDB(), providerService), runService)
+	gameDirectorBridge.SetPersonaServices(emotionService, memoryService, beliefService, relationDynamicsService)
+	gamePlayerService.SetDirectorBridge(gameDirectorBridge)
+	gamePlayerSessionHandler := handler.NewGamePlayerSessionHandler(gamePlayerService)
+	// H7.2 UI 插槽 / H7.4 权限 / H7.5 用量
+	extensionSlotService := services.NewExtensionSlotService(database.GetDB())
+	extensionSlotHandler := handler.NewExtensionSlotHandler(extensionSlotService)
+	extensionAuthzHandler := handler.NewExtensionAuthzHandler(extensionAuthzService)
+	extensionIdentityHandler := handler.NewExtensionIdentityHandler(extensionIdentityService)
+	usageService := services.NewUsageService(database.GetDB())
+	usageAdminHandler := handler.NewUsageAdminHandler(usageService)
+	// H7.5 用量埋点注入（nil 安全）
+	agentChatHandler.SetUsageService(usageService)
+	// H7.3 模板库
+	templateService := services.NewTemplateService(database.GetDB())
+	templateService.SetRunService(runService)
+	if err := templateService.EnsureSeedTemplates(); err != nil {
+		log.Printf("ensure seed templates failed: %v", err)
+	}
+	templateAdminHandler := handler.NewTemplateAdminHandler(templateService)
+	collaborationHandler := handler.NewCollaborationHandler(services.NewCollaborationService(database.GetDB()))
+	workflowService := services.NewWorkflowService(database.GetDB())
+	workflowService.SetDispatcher(services.NewWorkflowAgentDispatcher(agentChatSvc))
+	workflowService.SetPersonaHooks(emotionService, relationDynamicsService)
+	workflowService.SetPersonaCapabilityGate(personaGate)
+	workflowService.SetUsageService(usageService)
+	workflowHandler := handler.NewWorkflowHandler(workflowService)
+	decisionService := services.NewDecisionService(database.GetDB())
+	decisionService.SetWorkflowService(workflowService)
+	decisionHandler := handler.NewDecisionHandler(decisionService)
+
+	// push-key 通道的租户归属按模式解析：builtin 忽略 org 恒 "default"；
+	// casdoor 下 org 缺省时解析为 tenant_oauth_clients 的 default 行组织。
+	chatHandler := handler.NewChatHandler(cfg.Auth.Mode, func() (string, bool) {
+		row, err := repository.NewTenantOAuthClientRepository().FindDefault()
+		if err != nil || row == nil {
+			return "", false
+		}
+		return row.Org, true
+	})
+
+	// MultiRAG sync client: only construct when both base URL and API key
+	// are configured. When nil, the sync-multirag endpoint returns 503 and
+	// the knowledge /multirag/models proxy returns 503. The same concrete
+	// *multirag.Client backs both the sync (provider) and my_llms (knowledge)
+	// features — it implements both provider.MultiRAGClient and
+	// provider.MultiRAGMyLLMsSource.
+	var (
+		multiragSync   provider.MultiRAGClient
+		multiragMyLLMs provider.MultiRAGMyLLMsSource
+	)
+	if cfg.Knowledge.MultiragBaseURL != "" && cfg.Knowledge.MultiragAPIKey != "" {
+		c := multirag.NewClient(cfg.Knowledge.MultiragBaseURL, cfg.Knowledge.MultiragAPIKey)
+		multiragSync = c
+		multiragMyLLMs = c
+	}
+	providerHandler := handler.NewProviderHandler(providerService, multiragSync, auditRecorder)
+
+	knowledgeHandler := handler.NewKnowledgeHandler(knowledgeService, multiragMyLLMs)
+
+	// CLI token lifecycle: opaque cli_<hex> tokens for the zhub CLI.
+	// Backed by GORM directly (no repository layer needed) — service tests use
+	// sqlite for isolation.
+	cliTokenSvc := services.NewCLITokenService(database.GetDB())
+	cliTokenHandler := handler.NewCLITokenHandler(cliTokenSvc, auditRecorder)
+
+	// 首次启动时插入种子数据
+	if err := providerService.SeedIfEmpty(); err != nil {
+		log.Printf("Warning: provider seed failed: %v", err)
+	}
+	if err := toolService.SeedIfEmpty(); err != nil {
+		log.Printf("Warning: tool seed failed: %v", err)
+	}
+
+	mcpService := services.NewMcpService(cfg.Provider.EncryptionKey)
+	if err := mcpService.SeedBuiltins(cfg.Knowledge.MCPURL, cfg.Organization.MCPURL); err != nil {
+		log.Fatalf("Failed to seed builtin MCPs: %v", err)
+	}
+	if err := toolService.SeedBuiltins(); err != nil {
+		log.Fatalf("Failed to seed builtin tools: %v", err)
+	}
+	if err := toolService.BackfillBuiltinDescriptionEn(); err != nil {
+		log.Fatalf("Failed to backfill builtin tool English descriptions: %v", err)
+	}
+	if err := toolService.BackfillSubagentToolBindings(); err != nil {
+		log.Fatalf("Failed to backfill subagent tool bindings: %v", err)
+	}
+	mcpHandler := handler.NewMcpHandler(mcpService)
+
+	knowledgeMcpHandler := handler.NewKnowledgeMcpHandler(knowledgeService, agentService)
+	organizationMessageService := services.NewAgentMessageService(agentChatSvc)
+	organizationMessageService.SetPersonaHooks(beliefService, relationDynamicsService)
+	organizationMessageService.SetPersonaCapabilityGate(personaGate)
+	organizationMessageService.SetUsageService(usageService)
+	messageWaitService := services.NewAgentMessageWaitService()
+	organizationMessageService.SetMessageWaitService(messageWaitService)
+	organizationMcpHandler := handler.NewOrganizationMcpHandler(organizationMessageService)
+	organizationMcpHandler.SetMessageWaitService(messageWaitService)
+	organizationMcpHandler.SetWorkflowService(workflowService)
+	organizationMcpHandler.SetDecisionService(decisionService)
+	organizationMcpHandler.SetPersonaServices(emotionService, beliefService, memoryService, relationDynamicsService)
+	organizationMcpHandler.SetPersonaGate(personaGate)
+	organizationMcpHandler.SetPersonaRunResolver(runService.ActiveRunForAgent)
+	agentMessageAdminHandler := handler.NewAgentMessageAdminHandler(organizationMessageService)
+	personaAdminHandler := handler.NewPersonaAdminHandler(runService, beliefService)
+
+	// ==================== 路由管理 ====================
+
+	// /health
+	casdoorRequiredForHealth := cfg.Auth.IsCasdoor()
+	r.GET("/health", handler.HealthCheckForAuthMode(casdoorRequiredForHealth))
+	r.GET("/health/:service", handler.ServiceHealthCheckForAuthMode(casdoorRequiredForHealth))
+
+	// /api/v1/ops — 运维端点（组织 OAuth 客户端管理），不走 JWT 链，
+	// 由 X-Ops-Key 常量时间鉴权。OPS_API_KEY 为空 = 功能未启用，端点不挂载（等效 404）。
+	if cfg.Ops.APIKey != "" {
+		opsGroup := r.Group("/api/v1/ops", middleware.RequireOpsKey(cfg.Ops.APIKey))
+		opsHandler := handler.NewOpsTenantClientHandler(repository.NewTenantOAuthClientRepository(), cfg.Provider.EncryptionKey)
+		opsGroup.POST("/tenant-clients", opsHandler.Upsert)
+		opsGroup.GET("/tenant-clients", opsHandler.List)
+		opsGroup.DELETE("/tenant-clients/:org", opsHandler.Delete)
+	}
+
+	// 多组织 OAuth：把 tenant_oauth_clients 查询以回调注入 auth 包（auth 不能
+	// 反向依赖 persistence）。org="" 语义为查 default 行；查询出错/未注册/无
+	// default 均返回 false（fail closed，resolveClientCreds 决定回落链）。
+	tenantOAuthRepo := repository.NewTenantOAuthClientRepository()
+	hexKey := cfg.Provider.EncryptionKey
+	auth.SetTenantClientLookup(func(org string) (*auth.TenantClientCreds, bool) {
+		row, err := func() (*authdom.TenantOAuthClient, error) {
+			if org == "" {
+				return tenantOAuthRepo.FindDefault()
+			}
+			return tenantOAuthRepo.Find(org)
+		}()
+		if err != nil {
+			log.Printf("[OAuth] tenant client lookup org=%q failed: %v", org, err)
+			return nil, false
+		}
+		if row == nil {
+			return nil, false
+		}
+		secret, err := provider.Decrypt(row.ClientSecretEnc, hexKey)
+		if err != nil {
+			log.Printf("[OAuth] decrypt client secret org=%q failed: %v", org, err)
+			return nil, false
+		}
+		certPEM := ""
+		if row.CertEnc != "" {
+			certPEM, err = provider.Decrypt(row.CertEnc, hexKey)
+			if err != nil {
+				log.Printf("[OAuth] decrypt cert org=%q failed: %v", org, err)
+				return nil, false
+			}
+		}
+		return &auth.TenantClientCreds{ClientID: row.ClientID, ClientSecret: secret, CertPEM: certPEM}, true
+	})
+
+	// /auth — endpoints are mode-conditional. builtin mode serves setup/login/
+	// register/refresh/change-password locally; casdoor mode keeps the OAuth
+	// redirect flow. /auth/mode and /auth/userinfo are common to both.
+	authGroup := r.Group("/auth")
+	{
+		if cfg.Auth.IsBuiltin() {
+			rl := middleware.IPRateLimit(10, time.Minute)
+			authGroup.GET("/mode", builtinAuthHandler.GetMode)
+			authGroup.POST("/setup", rl, builtinAuthHandler.Setup)
+			authGroup.POST("/login", rl, builtinAuthHandler.Login)
+			authGroup.POST("/refresh", rl, builtinAuthHandler.Refresh)
+			authGroup.POST("/logout", middleware.JWTAuthWithCLI(cliTokenSvc, authProvider), builtinAuthHandler.Logout)
+			authGroup.POST("/register", rl, builtinAuthHandler.Register)
+			authGroup.GET("/invite/:token", rl, builtinAuthHandler.InvitePrecheck)
+			authGroup.POST("/change-password", middleware.JWTAuthWithCLI(cliTokenSvc, authProvider), builtinAuthHandler.ChangePassword)
+			authGroup.GET("/userinfo", middleware.JWTAuthWithCLI(cliTokenSvc, authProvider), handler.UserInfo)
+		} else {
+			orgCheckHandler := handler.NewOrgCheckHandler(tenantOAuthRepo)
+			rl := middleware.IPRateLimit(10, time.Minute)
+			// /auth/mode 是登录页渲染依据的只读端点，必须与登录/预检/刷新
+			// 隔离限流：共享 rl 时用户正常登录操作（org-check/login/refresh）
+			// 会挤占额度把 mode 打成 429，前端拿不到 mode 会 fail-open 到
+			// builtin 表单（casdoor 部署无本地登录端点，表单不可用）。
+			rlMode := middleware.IPRateLimit(60, time.Minute)
+			authGroup.GET("/mode", rlMode, orgCheckHandler.CasdoorMode)
+			authGroup.GET("/org-check", rl, orgCheckHandler.OrgCheck)
+			authGroup.GET("/login", rl, handler.Login)
+			authGroup.GET("/callback", rl, handler.Callback(casdoorProvider, auditRecorder))
+			authGroup.GET("/userinfo", middleware.JWTAuthWithCLI(cliTokenSvc, authProvider), handler.UserInfo)
+			authGroup.POST("/logout", middleware.JWTAuth(authProvider), func(c *gin.Context) {
+				handler.Logout(c, auditRecorder)
+			})
+			authGroup.POST("/refresh", rl, handler.RefreshToken)
+		}
+	}
+
+	// GuestGuard 紧跟鉴权中间件挂载（同一链）：有效 guest（显式 guest 角色，
+	// 或空角色的 casdoor/cli 用户）除既有白名单（/auth/userinfo、/auth/logout、
+	// /health*）、issue #132 配置读取端点（GET /api/v1/providers[/runtime-config]、
+	// /api/v1/agents[/manifest|/{name}]、/api/v1/skills[/{name}[/download]]）、
+	// GET /api/v1/scenes 与聊天端点树（/api/v1/agents/{name}/chat/**，全 method）
+	// 外一律 403，前端据 PENDING_APPROVAL 前缀引导至 Agent 聊天页；桌面 App
+	// 依赖配置端点完成模型/Agent/SKILL 配置同步（guest 仅可读配置，不可写）。
+	// 正式角色用户 guard 直接放行，行为零变化。
+	// /auth/* 与 /health 挂在根级（白名单内），静态资源 /static 不在本链，均不受影响。
+	// Extension identity is evaluated before human authentication. A verified
+	// extension uses its own credential and never needs a reusable admin JWT.
+	// ExtensionAPIGuard is default-deny and maps the small set of core APIs an
+	// extension may call to manifest permissions.
+	v1group := r.Group("/api/v1",
+		middleware.ExtensionIdentity(extensionIdentityService),
+		middleware.JWTAuthWithCLIOrExtension(cliTokenSvc, authProvider),
+		jwtutil.GuestGuard(),
+		middleware.ExtensionAPIGuard(extensionAuthzService))
+	// H7.4（P0）扩展身份认证：挂在 v1group 上，先于一切授权判定。带
+	// X-Extension-Name / X-Extension-Token 的请求先验证凭据（Hub 签发），
+	// 通过后把已认证扩展名写入上下文；不带这两个头的既有请求（前端控制台、
+	// Agent Runtime）行为完全不变。授权中间件只认上下文里的已认证名字，
+	// 因此"自己报一个扩展名"不再能影响任何判定。
+	// H7.2 扩展数据代理：登录用户可访问已启用扩展声明的 GET 端点（限流 60/min）
+	extProxyGroup := v1group.Group("/extensions/:name",
+		middleware.ExtensionRateLimitByParam(middleware.ExtensionRateLimitConfig{RequestsPerMinute: 60},
+			func(c *gin.Context) string { return c.Param("name") }))
+	extProxyGroup.GET("/*wildcard", extensionSlotHandler.Proxy)
+	// 管理写操作 + 敏感读：admin | maintainer（member 只读权限见 spec）
+	adminWrite := v1group.Group("/admin", middleware.RequireManager())
+	// 非敏感只读：admin | maintainer | member（逐条显式授予，见 spec 端点表）
+	adminRead := v1group.Group("/admin", middleware.RequireRole("admin", "maintainer", "member"))
+
+	// ---------- Extension protocol H0 verification ----------
+	// Metadata/examples are safe for all approved members. Inline validation is
+	// manager-only and never resolves file references from pasted manifests.
+	adminRead.GET("/extensions/h0", extensionVerificationHandler.Overview)
+	adminWrite.POST("/extensions/validate", extensionVerificationHandler.Validate)
+
+	// ---------- H1 isolated runs and generic state ----------
+	// H7.4 扩展身份强制检查：已认证扩展按 (permission, action, resource) 判定，
+	// 无授权 403；无扩展身份的既有请求零影响（中间件内部放行）。
+	// 覆盖面按"同一资源读写同权"对齐：同一资源不能出现"读受检查、写不受检查"，
+	// 否则持有 read 授权的扩展可以直接改成写。
+	runResource := func(c *gin.Context) string { return c.Param("id") }
+	adminRead.GET("/runs", middleware.ExtensionAuthz(extensionAuthzService, "run", "read", nil), runHandler.List)
+	adminWrite.POST("/runs", middleware.ExtensionAuthz(extensionAuthzService, "run", "write", nil), runHandler.Create)
+	adminRead.GET("/runs/:id", middleware.ExtensionAuthz(extensionAuthzService, "run", "read", runResource), runHandler.Get)
+	adminWrite.POST("/runs/:id/transitions", middleware.ExtensionAuthz(extensionAuthzService, "run", "update", runResource), runHandler.Transition)
+	adminWrite.POST("/runs/:id/agents", middleware.ExtensionAuthz(extensionAuthzService, "run", "write", runResource), runHandler.AddAgent)
+	adminWrite.PUT("/runs/:id/route-plan", middleware.ExtensionAuthz(extensionAuthzService, "run", "write", runResource), runHandler.PutRoutePlan)
+	adminRead.GET("/runs/:id/route-plan", middleware.ExtensionAuthz(extensionAuthzService, "run", "read", runResource), runHandler.GetRoutePlan)
+	adminWrite.POST("/state-schemas", middleware.ExtensionAuthz(extensionAuthzService, "state", "write", nil), runHandler.RegisterSchema)
+	adminWrite.POST("/runs/:id/states", middleware.ExtensionAuthz(extensionAuthzService, "state", "write", runResource), runHandler.InitializeState)
+	adminWrite.PUT("/runs/:id/states/:stateId", middleware.ExtensionAuthz(extensionAuthzService, "state", "write", runResource), runHandler.CommitState)
+	adminRead.GET("/runs/:id/state-changes", middleware.ExtensionAuthz(extensionAuthzService, "state", "read", runResource), runHandler.StateChanges)
+	adminRead.GET("/runs/:id/activities", middleware.ExtensionAuthz(extensionAuthzService, "run", "read", runResource), runHandler.Activities)
+	adminRead.GET("/runs/:id/events", middleware.ExtensionAuthz(extensionAuthzService, "event", "read", runResource), eventHandler.ListRun)
+	adminWrite.POST("/runs/:id/activities", middleware.ExtensionAuthz(extensionAuthzService, "run", "write", runResource), runHandler.AppendActivity)
+	adminRead.GET("/runs/:id/tool-results", middleware.ExtensionAuthz(extensionAuthzService, "tool", "read", runResource), toolResultHandler.List)
+	adminRead.GET("/runs/:id/agent-messages", middleware.ExtensionAuthz(extensionAuthzService, "message", "read", runResource), agentMessageAdminHandler.ListRun)
+	// H6 persona admin views (read-only; same authorization as neighboring run reads)
+	adminRead.GET("/runs/:id/persona-state", middleware.ExtensionAuthz(extensionAuthzService, "state", "read", runResource), personaAdminHandler.PersonaState)
+	adminRead.GET("/runs/:id/belief-disputes", middleware.ExtensionAuthz(extensionAuthzService, "state", "read", runResource), personaAdminHandler.BeliefDisputes)
+	adminRead.GET("/channels/:id/messages", agentMessageAdminHandler.ListChannel)
+	adminWrite.GET("/agent-message-chains", agentMessageAdminHandler.GetChain)
+	adminRead.GET("/runs/:id/tool-results/:toolResultId", toolResultHandler.Get)
+	adminWrite.POST("/runs/:id/tool-results/validate", toolResultHandler.Validate)
+	adminWrite.POST("/runs/:id/tool-results", toolResultHandler.Commit)
+	adminWrite.POST("/runs/:id/tool-results/reject", toolResultHandler.Reject)
+	adminWrite.POST("/runs/:id/agents/:agentId/prompt", promptComposerHandler.Compose)
+	adminRead.GET("/runs/:id/agents/:agentId/prompt", promptComposerHandler.Latest)
+	adminRead.GET("/capability-packages", capabilityRegistryHandler.List)
+	adminWrite.POST("/capability-packages", capabilityRegistryHandler.Register)
+	adminWrite.POST("/capability-packages/:id/approve", capabilityRegistryHandler.Approve)
+	// H7.0 扩展注册中心（通用扩展市场，独立于 H6 capability-packages）
+	adminWrite.POST("/extensions", extensionAdminHandler.Register)
+	adminRead.GET("/extensions", extensionAdminHandler.List)
+	adminRead.GET("/extensions/:id", extensionAdminHandler.Get)
+	adminWrite.POST("/extensions/:id/install", extensionAdminHandler.Install)
+	adminWrite.POST("/extensions/:id/enable", extensionAdminHandler.Enable)
+	adminWrite.POST("/extensions/:id/disable", extensionAdminHandler.Disable)
+	adminWrite.POST("/extensions/:id/upgrade", extensionAdminHandler.Upgrade)
+	adminWrite.POST("/extensions/:id/rollback", extensionAdminHandler.Rollback)
+	adminWrite.DELETE("/extensions/:id/uninstall", extensionAdminHandler.Uninstall)
+	adminRead.GET("/extensions/:id/impact", extensionAdminHandler.Impact)
+	adminRead.GET("/extensions/:id/versions/:version", extensionAdminHandler.GetVersion)
+	// M0 generic game-package registry and deterministic fixture runner.
+	adminWrite.POST("/game-packages", gamePackageHandler.Register)
+	adminWrite.POST("/game-packages/acceptance-data", gamePackageHandler.EnsureAcceptanceFixtures)
+	adminRead.GET("/game-packages", gamePackageHandler.List)
+	adminRead.GET("/game-packages/:id", gamePackageHandler.Get)
+	adminWrite.PATCH("/game-packages/:id/enabled", gamePackageHandler.SetEnabled)
+	adminWrite.POST("/game-packages/:id/test-runs", gamePackageHandler.TestRun)
+	// Creator-facing editable game projects. Publishing creates an immutable
+	// game-package version; packages themselves are never editing sources.
+	adminWrite.POST("/game-projects", gameProjectHandler.Create)
+	adminRead.GET("/game-projects", gameProjectHandler.List)
+	adminRead.GET("/game-projects/:id", gameProjectHandler.Get)
+	adminRead.GET("/game-projects/:id/publish-check", gameProjectHandler.PublishCheck)
+	adminRead.GET("/game-projects/:id/releases/:releaseId", gameProjectHandler.GetRelease)
+	adminWrite.POST("/game-projects/:id/releases/:releaseId/restore", gameProjectHandler.RestoreRelease)
+	adminWrite.PUT("/game-projects/:id", gameProjectHandler.Update)
+	adminWrite.POST("/game-projects/:id/publish", gameProjectHandler.Publish)
+	adminWrite.POST("/game-projects/:id/preview-action", gameProjectHandler.PreviewAction)
+	adminWrite.POST("/game-projects/:id/preview-events", gameProjectHandler.PreviewEventSchedule)
+	adminWrite.POST("/game-projects/:id/events/:eventId/preview", gameProjectHandler.PreviewEvent)
+	adminWrite.POST("/game-projects/:id/events/preview", gameProjectHandler.PreviewEventSchedule)
+	adminRead.GET("/game-projects/:id/assets", gameAssetHandler.List)
+	adminWrite.POST("/game-projects/:id/assets", gameAssetHandler.Upload)
+	adminWrite.PUT("/game-projects/:id/assets/:assetId", gameAssetHandler.Replace)
+	adminRead.GET("/game-projects/:id/assets/:assetId/content", gameAssetHandler.Content)
+	adminWrite.DELETE("/game-projects/:id/assets/:assetId", gameAssetHandler.Delete)
+	adminWrite.POST("/game-projects/:id/scenes", gameProjectHandler.CreateScene)
+	adminWrite.PUT("/game-projects/:id/scenes/:sceneId", gameProjectHandler.UpdateScene)
+	adminWrite.DELETE("/game-projects/:id/scenes/:sceneId", gameProjectHandler.DeleteScene)
+	adminRead.GET("/game-projects/:id/characters/:characterId/context-preview", gameProjectHandler.PreviewCharacterContext)
+	adminWrite.POST("/game-projects/:id/sessions", gameSessionHandler.Create)
+	adminRead.GET("/game-projects/:id/sessions", gameSessionHandler.List)
+	adminRead.GET("/game-projects/:id/sessions/:sessionId", gameSessionHandler.Get)
+	adminWrite.POST("/game-projects/:id/sessions/:sessionId/advance", gameSessionHandler.Advance)
+	adminWrite.POST("/game-projects/:id/sessions/:sessionId/pause", gameSessionHandler.Pause)
+	adminWrite.POST("/game-projects/:id/sessions/:sessionId/resume", gameSessionHandler.Resume)
+	adminWrite.POST("/game-projects/:id/sessions/:sessionId/end", gameSessionHandler.End)
+	adminWrite.POST("/game-projects/:id/player-sessions", gamePlayerSessionHandler.Create)
+	adminRead.GET("/game-projects/:id/player-sessions/:sessionId", gamePlayerSessionHandler.Get)
+	adminWrite.POST("/game-projects/:id/player-sessions/:sessionId/interpret", gamePlayerSessionHandler.Interpret)
+	adminWrite.POST("/game-projects/:id/player-sessions/:sessionId/confirm", gamePlayerSessionHandler.Confirm)
+	adminWrite.POST("/game-projects/:id/player-sessions/:sessionId/reject", gamePlayerSessionHandler.Reject)
+	adminWrite.POST("/game-projects/:id/player-sessions/:sessionId/objectives/accept", gamePlayerSessionHandler.AcceptObjective)
+	adminWrite.POST("/game-projects/:id/player-sessions/:sessionId/objectives/reject", gamePlayerSessionHandler.RejectObjective)
+	adminWrite.POST("/game-projects/:id/player-sessions/:sessionId/reset", gamePlayerSessionHandler.Reset)
+	// Published play-throughs are ordinary signed-in player APIs, never admin
+	// editor APIs. They can only start from the immutable release snapshot.
+	v1group.GET("/games/:releaseId", gamePlayerSessionHandler.ReleaseDetail)
+	v1group.POST("/games/:releaseId/sessions", gamePlayerSessionHandler.CreateRelease)
+	v1group.GET("/games/:releaseId/sessions/:sessionId", gamePlayerSessionHandler.GetRelease)
+	v1group.POST("/games/:releaseId/sessions/:sessionId/interpret", gamePlayerSessionHandler.InterpretRelease)
+	v1group.POST("/games/:releaseId/sessions/:sessionId/confirm", gamePlayerSessionHandler.ConfirmRelease)
+	v1group.POST("/games/:releaseId/sessions/:sessionId/reject", gamePlayerSessionHandler.RejectRelease)
+	v1group.POST("/games/:releaseId/sessions/:sessionId/objectives/accept", gamePlayerSessionHandler.AcceptObjectiveRelease)
+	v1group.POST("/games/:releaseId/sessions/:sessionId/objectives/reject", gamePlayerSessionHandler.RejectObjectiveRelease)
+	v1group.POST("/games/:releaseId/sessions/:sessionId/reset", gamePlayerSessionHandler.ResetRelease)
+	v1group.GET("/games/:releaseId/assets/:assetId", gameAssetHandler.ReleaseContent)
+	// H7.2 UI 插槽
+	adminRead.GET("/extensions/slots", extensionSlotHandler.ListSlots)
+	adminWrite.POST("/extensions/:id/slots/:slot/visible", extensionSlotHandler.SetSlotVisible)
+	// H7.4 扩展权限与审计
+	adminRead.GET("/extensions/:id/grants", extensionAuthzHandler.ListGrants)
+	adminRead.GET("/extensions/:id/audit", extensionAuthzHandler.ListAudit)
+	adminWrite.POST("/extensions/:id/grants/:grantId/approve", extensionAuthzHandler.ApproveGrant)
+	adminWrite.DELETE("/extensions/:id/grants/:grantId", extensionAuthzHandler.RevokeGrant)
+	// H7.4 扩展身份凭据（P0）：签发/轮换与查询（明文仅签发响应返回一次）
+	adminRead.GET("/extensions/:id/credential", extensionIdentityHandler.Describe)
+	adminWrite.POST("/extensions/:id/credential", extensionIdentityHandler.Issue)
+	// H7.3 模板库
+	adminWrite.POST("/templates", templateAdminHandler.Register)
+	adminRead.GET("/templates", templateAdminHandler.List)
+	adminRead.GET("/templates/:id", templateAdminHandler.Get)
+	adminRead.GET("/templates/:id/versions/:version", templateAdminHandler.GetVersion)
+	adminWrite.POST("/templates/:id/preview", templateAdminHandler.Preview)
+	adminWrite.POST("/templates/:id/install", templateAdminHandler.Install)
+	adminWrite.POST("/templates/:id/export", templateAdminHandler.Export)
+	// H7.5 用量与运维
+	adminRead.GET("/usage/summary", usageAdminHandler.Summary)
+	adminRead.GET("/usage/by-extension", usageAdminHandler.ByExtension)
+	adminRead.GET("/usage/by-agent", usageAdminHandler.ByAgent)
+	adminRead.GET("/usage/by-run", usageAdminHandler.ByRun)
+	adminRead.GET("/usage/by-model", usageAdminHandler.ByModel)
+	adminRead.GET("/usage/errors", usageAdminHandler.Errors)
+	adminRead.GET("/usage/storage", usageAdminHandler.Storage)
+	adminRead.GET("/usage/health", usageAdminHandler.Health)
+	adminRead.GET("/usage/export", usageAdminHandler.Export)
+	adminRead.GET("/usage/budgets", usageAdminHandler.ListBudgets)
+	adminWrite.PUT("/usage/budgets", usageAdminHandler.UpsertBudget)
+	adminWrite.DELETE("/usage/budgets/:id", usageAdminHandler.DeleteBudget)
+	adminRead.GET("/usage/alerts", usageAdminHandler.ListAlerts)
+	adminWrite.PUT("/usage/alerts", usageAdminHandler.UpsertAlert)
+	adminWrite.DELETE("/usage/alerts/:id", usageAdminHandler.DeleteAlert)
+	adminRead.GET("/usage/alerts/events", usageAdminHandler.AlertEvents)
+	adminRead.GET("/usage/pricing", usageAdminHandler.GetPricing)
+	adminWrite.PUT("/usage/pricing", usageAdminHandler.PutPricing)
+	adminWrite.PATCH("/capability-packages/:id/enabled", capabilityRegistryHandler.SetEnabled)
+	adminRead.GET("/capability-packages/:id/resources", capabilityRegistryHandler.Resources)
+
+	// ---------- H4 group and channel collaboration ----------
+	handler.RegisterCollaborationRoutes(adminWrite, adminRead, collaborationHandler)
+	// ---------- H5 reusable workflows and approvals ----------
+	// H7.4 扩展身份强制检查：workflow 读写按 (workflow, read/write) 判定。
+	handler.RegisterWorkflowRoutes(
+		adminWrite.Group("", middleware.ExtensionAuthz(extensionAuthzService, "workflow", "write", nil)),
+		adminRead.Group("", middleware.ExtensionAuthz(extensionAuthzService, "workflow", "read", nil)),
+		workflowHandler)
+	handler.RegisterDecisionRoutes(adminWrite, adminRead, decisionHandler)
+
+	// ---------- Audit 领域 ----------
+	// 审计日志查询：admin-only（spec §5.3）；builtin/casdoor 两模式公共区注册。
+	// （auditRepo/auditRecorder 已在认证装配区创建——auth 埋点写入侧先于路由装配。）
+	auditQuerier := services.NewAuditQuerier(auditRepo)
+	auditHandler := handler.NewAuditHandler(auditQuerier)
+	v1group.Group("/admin", middleware.RequireAdmin()).GET("/audit-logs", auditHandler.List)
+
+	// ---------- Agent 领域 ----------
+	// 公开接口
+	agentsGroup := v1group.Group("/agents")
+	{
+		agentsGroup.GET("/manifest", agentHandler.Manifest)
+		agentsGroup.GET("", agentHandler.List)
+		agentsGroup.GET("/:name", agentHandler.Get)
+
+		// Agent chat (regular user)
+		agentsGroup.GET("/:name/chat/sessions", agentChatHandler.ListSessions)
+		agentsGroup.POST("/:name/chat/sessions", agentChatHandler.CreateSession)
+		agentsGroup.GET("/:name/chat/sessions/:id/messages", agentChatHandler.ListMessages)
+		agentsGroup.DELETE("/:name/chat/sessions/:id", agentChatHandler.DeleteSession)
+		agentsGroup.POST("/:name/chat/sessions/:id/messages", agentChatHandler.SendMessage)
+
+		// Agent chat attachments (issue #94)
+		agentsGroup.GET("/:name/chat/capabilities", agentChatHandler.Capabilities)
+		agentsGroup.POST("/:name/chat/sessions/:id/uploads", agentChatHandler.UploadAttachments)
+		agentsGroup.GET("/:name/chat/sessions/:id/attachments/content", agentChatHandler.AttachmentContent)
+	}
+
+	// 管理接口：写方法/敏感 GET（files/content）→ write 组；
+	// 非敏感 GET（列表、detail、tools、skills、mcps、knowledge、files 列表、deploy 状态）→ read 组（member 只读）
+	adminAgentsGroup := adminWrite.Group("/agents")
+	// H7.4 扩展身份强制检查：管理端 agent 只读接口按 (agent, read) 判定。
+	adminAgentsReadGroup := adminRead.Group("/agents",
+		middleware.ExtensionAuthz(extensionAuthzService, "agent", "read",
+			func(c *gin.Context) string { return c.Param("name") }))
+	{
+		adminAgentsReadGroup.GET("", agentHandler.ListAdmin)
+		adminAgentsGroup.POST("", agentHandler.Create)
+		adminAgentsGroup.PUT("/:name", agentHandler.Update)
+		adminAgentsGroup.DELETE("/:name", agentHandler.Delete)
+		adminAgentsGroup.PUT("/:name/subagents", agentHandler.UpdateSubagents)
+		adminAgentsReadGroup.GET("/:name/tools", toolHandler.GetAgentTools)
+		adminAgentsGroup.PUT("/:name/tools", toolHandler.UpdateAgentTools)
+		adminAgentsReadGroup.GET("/:name/skills", skillHandler.GetAgentSkills)
+		adminAgentsGroup.PUT("/:name/skills", skillHandler.UpdateAgentSkills)
+		adminAgentsReadGroup.GET("/:name/mcps", mcpHandler.GetAgentMcps)
+		adminAgentsGroup.PUT("/:name/mcps", mcpHandler.UpdateAgentMcps)
+		adminAgentsReadGroup.GET("/:name/knowledge", agentHandler.GetAgentKnowledge)
+		adminAgentsGroup.PUT("/:name/knowledge", agentHandler.UpdateAgentKnowledge)
+		adminAgentsGroup.POST("/:name/probe", agentHandler.ProbeAgent)
+		adminAgentsGroup.POST("/:name/deploy", agentHandler.DeployAgent)
+		// 部署状态：member 可读（含 runtimeUrl/apiKey——内部可信环境，产品已确认）
+		adminAgentsReadGroup.GET("/:name/deploy", agentHandler.GetDeployment)
+		adminAgentsGroup.POST("/:name/deploy/stop", agentHandler.StopDeployment)
+		adminAgentsGroup.POST("/:name/deploy/start", agentHandler.StartDeployment)
+		adminAgentsGroup.DELETE("/:name/deploy", agentHandler.DeleteDeployment)
+		adminAgentsReadGroup.GET("/:name/detail", agentDetailHandler.GetAgentDetail)
+		adminAgentsReadGroup.GET("/:name/files", agentFilesHandler.ListFiles)
+		// 文件内容属敏感信息，留 write 组
+		adminAgentsGroup.GET("/:name/files/content", agentFilesHandler.GetContent)
+		adminAgentsGroup.HEAD("/:name/files/content", agentFilesHandler.HeadContent)
+	}
+
+	// ---------- Tool 领域 ----------
+	// 写方法 → write 组；GET 列表/详情 → read 组（member 只读）
+	toolsGroup := adminWrite.Group("/tools")
+	toolsReadGroup := adminRead.Group("/tools")
+	{
+		toolsReadGroup.GET("", toolHandler.List)
+		toolsGroup.POST("", toolHandler.Create)
+		toolsReadGroup.GET("/:name", toolHandler.Get)
+		toolsGroup.PUT("/:name", toolHandler.Update)
+		toolsGroup.PUT("/:name/file", toolHandler.UploadFile)
+		toolsReadGroup.GET("/:name/download", toolHandler.Download)
+		toolsGroup.DELETE("/:name", toolHandler.Delete)
+	}
+
+	// ---------- MCP 领域 ----------
+	// 公开接口（客户端按 agent 拉取 MCP 配置，已解密可直接喂给 SDK）
+	mcpsGroup := v1group.Group("/mcps")
+	{
+		mcpsGroup.GET("", mcpHandler.GetClientMcpsByAgent)
+	}
+
+	// 管理接口（CRUD）：写方法/probe → write 组；GET 列表/详情 → read 组（member 只读）
+	adminMcpsGroup := adminWrite.Group("/mcps")
+	adminMcpsReadGroup := adminRead.Group("/mcps")
+	{
+		adminMcpsReadGroup.GET("", mcpHandler.List)
+		adminMcpsGroup.POST("", mcpHandler.Create)
+		adminMcpsGroup.POST("/probe", mcpHandler.ProbeByConfig)
+		adminMcpsReadGroup.GET("/:name", mcpHandler.Get)
+		adminMcpsGroup.PUT("/:name", mcpHandler.Update)
+		adminMcpsGroup.POST("/:name/probe", mcpHandler.ProbeByName)
+		adminMcpsGroup.DELETE("/:name", mcpHandler.Delete)
+	}
+
+	// ---------- Skill 领域 ----------
+	// 公开接口
+	skillsGroup := v1group.Group("/skills")
+	{
+		skillsGroup.GET("", skillHandler.ListPublic)
+		skillsGroup.GET("/:name", skillHandler.GetPublic)
+		skillsGroup.GET("/:name/download", skillHandler.Download)
+	}
+
+	// 管理接口：GET 列表（ListAdmin）/skill-md → read 组（member 只读）；写方法 → write 组
+	adminSkillsGroup := adminWrite.Group("/skills")
+	adminSkillsReadGroup := adminRead.Group("/skills")
+	{
+		adminSkillsReadGroup.GET("", skillHandler.ListAdmin)
+		adminSkillsGroup.POST("", skillHandler.Create)
+		adminSkillsGroup.PUT("/:name", skillHandler.Update)
+		adminSkillsGroup.DELETE("/:name", skillHandler.Delete)
+		adminSkillsReadGroup.GET("/:name/skill-md", skillHandler.GetSkillMd)
+	}
+
+	// ---------- Scene 领域 ----------
+	// 公开接口
+	scenesGroup := v1group.Group("/scenes")
+	{
+		scenesGroup.GET("", sceneHandler.List)
+		scenesGroup.GET("/:name", sceneHandler.Get)
+	}
+
+	// 管理接口：GET 列表（ListAdmin）→ read 组（member 只读）；写方法 → write 组
+	adminScenesGroup := adminWrite.Group("/scenes")
+	adminScenesReadGroup := adminRead.Group("/scenes")
+	{
+		adminScenesReadGroup.GET("", sceneHandler.ListAdmin)
+		adminScenesGroup.POST("", sceneHandler.Create)
+		adminScenesGroup.PUT("/:name", sceneHandler.Update)
+		adminScenesGroup.DELETE("/:name", sceneHandler.Delete)
+	}
+
+	// ---------- Prompt-first 人格库 ----------
+	adminPersonalitiesGroup := adminWrite.Group("/personalities")
+	adminPersonalitiesReadGroup := adminRead.Group("/personalities")
+	{
+		adminPersonalitiesReadGroup.GET("", personalityHandler.List)
+		adminPersonalitiesReadGroup.GET("/:name", personalityHandler.Get)
+		adminPersonalitiesGroup.POST("", personalityHandler.Create)
+		adminPersonalitiesGroup.PUT("/:name", personalityHandler.Update)
+		adminPersonalitiesGroup.DELETE("/:name", personalityHandler.Delete)
+	}
+
+	// ---------- Agent 组织关系 ----------
+	// 一条记录是一条有向边；双向关系由创建接口原子写入两条边。
+	adminRelationsGroup := adminWrite.Group("/agent-relations")
+	adminRelationsReadGroup := adminRead.Group("/agent-relations")
+	{
+		adminRelationsReadGroup.GET("", agentRelationHandler.List)
+		adminRelationsReadGroup.GET("/:id/events", agentRelationHandler.ListEvents)
+		adminRelationsGroup.POST("", agentRelationHandler.Create)
+		adminRelationsGroup.POST("/:id/events", agentRelationHandler.RecordEvent)
+		adminRelationsGroup.PUT("/:id", agentRelationHandler.Update)
+		adminRelationsGroup.DELETE("/:id", agentRelationHandler.Delete)
+	}
+	adminRelationTypesGroup := adminWrite.Group("/relation-types")
+	adminRelationTypesReadGroup := adminRead.Group("/relation-types")
+	{
+		adminRelationTypesReadGroup.GET("", relationTypeHandler.List)
+		adminRelationTypesGroup.POST("", relationTypeHandler.Create)
+		adminRelationTypesGroup.PUT("/:name", relationTypeHandler.Update)
+		adminRelationTypesGroup.DELETE("/:name", relationTypeHandler.Delete)
+	}
+
+	// ---------- Knowledge MCP 运行时 ----------
+	// This endpoint is called by the agent runtime with an Agent Runtime Token,
+	// not a user JWT, so it must not be under the JWTAuthWithCLI middleware group.
+	// H7.4（P0）：额外挂扩展身份链——若调用方声明自己是某个扩展（成对给出
+	// 名称+凭据），则必须持有效凭据且拥有对应 grants；未声明身份的既有
+	// Runtime Token 调用行为不变。
+	knowledgeMcpChain := []gin.HandlerFunc{
+		middleware.AgentRuntimeAuthMiddleware(cfg.Provider.EncryptionKey),
+		middleware.ExtensionIdentity(extensionIdentityService),
+		middleware.ExtensionAuthz(extensionAuthzService, "tool", "read", nil),
+		knowledgeMcpHandler.HandleMessage,
+	}
+	r.POST("/api/v1/knowledge/mcp", knowledgeMcpChain...)
+	// Organization MCP shares runtime-token authentication with knowledge MCP,
+	// but authorizes every send against the directed relation table.
+	organizationMcpChain := []gin.HandlerFunc{
+		middleware.AgentRuntimeAuthMiddleware(cfg.Provider.EncryptionKey),
+		middleware.ExtensionIdentity(extensionIdentityService),
+		middleware.ExtensionAuthz(extensionAuthzService, "message", "write", nil),
+		organizationMcpHandler.HandleMessage,
+	}
+	r.POST("/api/v1/organization/mcp", organizationMcpChain...)
+
+	// ---------- Knowledge 领域 ----------
+	// 非敏感 GET（datasets/documents/chunks/images 等）→ read 组（member 只读），写方法与 POST /retrieval → write 组
+	handler.RegisterKnowledgeRoutes(adminWrite, adminRead, knowledgeHandler)
+
+	// ---------- Chat 领域 ----------
+	// chat/push 双通道鉴权（X-Chat-Push-Key 或 JWT/CLI），必须挂在 v1group
+	// 之外：v1group 的组级 JWT 中间件会先于路由拒绝无 Authorization 的
+	// push-key 请求。URL 不变：POST /api/v1/chat/push。
+	chatPushGroup := r.Group("/api/v1/chat", middleware.ChatPushAuth(cfg.ChatPush.APIKey, cliTokenSvc, authProvider))
+	chatPushGroup.POST("/push", chatHandler.Push)
+
+	// 聊天历史：GET 会话/消息 → read 组（member 只读）；DELETE 也在 read 组（handler 层归属校验）
+	adminChatReadGroup := adminRead.Group("/chat")
+	{
+		adminChatReadGroup.GET("/sessions", chatHandler.ListSessions)
+		adminChatReadGroup.GET("/sessions/:id", chatHandler.GetSession)
+		adminChatReadGroup.GET("/sessions/:id/messages", chatHandler.ListMessages)
+		// member 可删自己的会话（handler 层归属校验，他人会话 404）
+		adminChatReadGroup.DELETE("/sessions/:id", chatHandler.DeleteSession)
+	}
+
+	// ---------- AIGC 标识配置 ----------
+	// 全部端点含敏感配置（密钥），整体留 write 组，member 不开放
+	adminAigcGroup := adminWrite.Group("/aigc")
+	{
+		adminAigcGroup.GET("/config", aigcConfigHandler.Get)
+		adminAigcGroup.PUT("/config", aigcConfigHandler.Save)
+		adminAigcGroup.POST("/config/rotate-key", aigcConfigHandler.RotateKey)
+		adminAigcGroup.DELETE("/config", aigcConfigHandler.Delete)
+	}
+
+	// ---------- Provider 领域 ----------
+	// 公开接口（Electron 应用读取 provider 配置 + 模型列表）
+	providersGroup := v1group.Group("/providers")
+	{
+		providersGroup.GET("", providerHandler.List)
+		providersGroup.GET("/runtime-config", providerHandler.ListRuntimeConfig)
+		providersGroup.GET("/:id", providerHandler.Get)
+	}
+
+	// 管理接口：GET 列表/attr-rules → read 组（member 只读）；
+	// 写方法与 reveal-key（敏感）→ write 组
+	adminProvidersGroup := adminWrite.Group("/providers")
+	adminProvidersReadGroup := adminRead.Group("/providers")
+	{
+		adminProvidersReadGroup.GET("", providerHandler.ListAdmin)
+		adminProvidersGroup.POST("", providerHandler.Create)
+		adminProvidersGroup.POST("/probe", providerHandler.ProbeConfig)
+		adminProvidersGroup.PUT("/:id", providerHandler.Update)
+		adminProvidersGroup.DELETE("/:id", providerHandler.Delete)
+		adminProvidersGroup.POST("/:id/probe", providerHandler.Probe)
+		adminProvidersGroup.POST("/:id/reveal-key", providerHandler.RevealAPIKey)
+		adminProvidersReadGroup.GET("/attr-rules", providerHandler.AttrRules)
+
+		// Per-model CRUD (Task 5): attach/update/delete a single model row.
+		adminProvidersGroup.POST("/:id/models", providerHandler.AddModel)
+		adminProvidersGroup.PATCH("/:id/models/:selectionId", providerHandler.UpdateModel)
+		adminProvidersGroup.DELETE("/:id/models/:selectionId", providerHandler.DeleteModel)
+
+		// MultiRAG sync (Task 6): push provider config to the configured MultiRAG.
+		adminProvidersGroup.POST("/:id/sync-multirag", providerHandler.SyncToMultiRAG)
+	}
+
+	// ---------- Admin user management (builtin: invites + local users; casdoor: casdoor API passthrough) ----------
+	// User management and invites are admin-only. Builtin mode also manages
+	// invites; casdoor mode delegates user management to the Casdoor admin API
+	// via the directory.
+	if cfg.Auth.IsBuiltin() {
+		usersAdmin := v1group.Group("/admin", middleware.RequireAdmin())
+		usersAdmin.GET("/users", adminUserHandler.ListUsers)
+		usersAdmin.PATCH("/users/:id", adminUserHandler.UpdateUser)
+		usersAdmin.POST("/users/:id/reset-password", adminUserHandler.ResetUserPassword)
+		usersAdmin.POST("/invites", adminUserHandler.CreateInvite)
+		usersAdmin.GET("/invites", adminUserHandler.ListInvites)
+		usersAdmin.DELETE("/invites/:id", adminUserHandler.RevokeInvite)
+	} else {
+		usersAdmin := v1group.Group("/admin", middleware.RequireAdmin())
+		usersAdmin.GET("/users/login-url", casdoorUserHandler.LoginURL)
+		usersAdmin.GET("/users", casdoorUserHandler.ListUsers)
+		usersAdmin.PATCH("/users/:id", casdoorUserHandler.UpdateUser)
+		usersAdmin.POST("/users/:id/reset-password", casdoorUserHandler.ResetUserPassword)
+	}
+
+	// ---------- CLI Token 领域 ----------
+	// CLI token 签发/查看/吊销仅 admin|maintainer（member 不开放；
+	// member 历史签发的 token 不吊销，仍可用于公开聊天接口调用）。
+	cliGroup := v1group.Group("/cli", middleware.RequireManager())
+	{
+		cliGroup.POST("/issue-token", cliTokenHandler.Issue)
+		cliGroup.GET("/tokens", cliTokenHandler.List)
+		cliGroup.DELETE("/tokens/:id", cliTokenHandler.Revoke)
+	}
+
+	// Runtime proxy: hub-fronted runtime API entry for the no-Kong mode.
+	// Kong mode keeps its own /{org}/{agent} Service/Route chain and must NOT
+	// register /runtime/* (falls to NoRoute → 302 /static).
+	if cfg.Kong.AdminURL == "" {
+		runtimeProxySvc := services.NewRuntimeProxyService(repository.NewAgentRepository(), cfg.Deployer.UpstreamHost)
+		handler.RegisterRuntimeProxyRoutes(r, runtimeProxySvc, services.AuthModeFromConfig(cfg.Auth.IsBuiltin()))
+	}
+
+	// 未匹配路由重定向到前端 SPA
+	r.NoRoute(func(c *gin.Context) {
+		c.Redirect(http.StatusFound, "/static")
+	})
+
+	// All background work shares the process lifecycle. Cancelling appCtx stops
+	// both reconcilers and the durable event workers before the database closes.
+	appCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	kongService.StartReconciler(appCtx)
+	eventWorkerDone := make(chan struct{})
+	messageResumeDispatcher := services.NewRuntimeResumeDispatcher(agentChatSvc, organizationMessageService)
+	messageTerminalHandler := services.NewAgentMessageTerminalHandler(messageWaitService, messageResumeDispatcher)
+	go func() {
+		defer close(eventWorkerDone)
+		err := eventService.RunWorkers(appCtx, 250*time.Millisecond, func(ctx context.Context, envelope eventdomain.Envelope) error {
+			return messageTerminalHandler.Handle(ctx, envelope)
+		}, func(err error) {
+			log.Printf("Event worker error: %v", err)
+		})
+		if err != nil && appCtx.Err() == nil {
+			log.Printf("Event worker stopped unexpectedly: %v", err)
+		}
+	}()
+
+	server := &http.Server{Addr: cfg.GetServerAddr(), Handler: r, ReadHeaderTimeout: 10 * time.Second}
+	serverErr := make(chan error, 1)
+	go func() {
+		log.Printf("Server starting on %s", cfg.GetServerAddr())
+		serverErr <- server.ListenAndServe()
+	}()
+
+	select {
+	case <-appCtx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Printf("HTTP server graceful shutdown failed: %v", err)
+		}
+		cancel()
+	case err := <-serverErr:
+		if err != nil && err != http.ErrServerClosed {
+			log.Printf("Failed to start server: %v", err)
+		}
+		stop()
+	}
+	<-eventWorkerDone
+}

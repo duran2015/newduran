@@ -1,0 +1,1086 @@
+import { useState, useMemo, useRef } from 'react'
+import { useTranslation } from 'react-i18next'
+import { Button, Spin, Modal, Select, Empty, Input, AutoComplete, Tag, message } from 'antd'
+import NameSearch from '@/components/NameSearch'
+import { PlusIcon, SquaresFourIcon, PlugIcon, CheckSquareIcon, ChatCircleDotsIcon } from '@phosphor-icons/react'
+import { createStyles } from 'antd-style'
+import PrimaryButton from '@/components/PrimaryButton'
+import type { Agent, DeploymentStatus } from '@/api/agents'
+import {
+  useAgents, useDeleteAgent, useUpdateAgent,
+  useUpdateSubagents, useUpdateAgentTools, useUpdateAgentSkills,
+  useProbeAgent,
+} from '@/queries/useAgents'
+import { useTools } from '@/queries/useTools'
+import { useSkills } from '@/queries/useSkills'
+import { useProviders } from '@/queries/useProviders'
+import { useMcps, useUpdateAgentMcps } from '@/queries/useMcps'
+import { useCanWrite } from '@/hooks/useCanWrite'
+import { agentApi } from '@/api/agents'
+import { unwrapResponse } from '@/api/client'
+import type { ApiEnvelope } from '@/api/client'
+import { tokens as tk } from '@/styles/tokens'
+import ExtensionSlotRenderer from '@/components/extensions/ExtensionSlotRenderer'
+import AgentCard from './AgentCard'
+import AgentForm from './AgentForm'
+import { buildToolOptions } from './toolOptions'
+import DeployModal from './DeployModal'
+import AgentKnowledgeModal from './AgentKnowledgeModal'
+import BulkActionBar from './bulk/BulkActionBar'
+import BulkConfirmModal from './bulk/BulkConfirmModal'
+import BulkTaskModal from './bulk/BulkTaskModal'
+import BulkTaskBubble from './bulk/BulkTaskBubble'
+import { useBulkAgentTask } from './bulk/useBulkAgentTask'
+import { classifyAllAgents } from './bulk/classifyBulkOperation'
+import type { BulkOperation, ClassifiedItem, PrecheckResult } from './bulk/classifyBulkOperation'
+import CardGrid from '@/components/CardGrid'
+import { useNavigate } from 'react-router'
+import { hasPendingArtifactUpdates } from './pendingArtifactUpdates'
+
+const useStyles = createStyles(({ css }) => ({
+  page: css`
+    animation: pageIn 0.35s ease;
+    @keyframes pageIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+  `,
+  pageHead: css`
+    display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 24px;
+    @media (max-width: 768px) { flex-direction: column; gap: 16px; }
+  `,
+  pageTitle: css`font-size: ${tk.text3xl}; font-weight: 700; color: ${tk.text}; letter-spacing: -0.03em; line-height: 1.15;`,
+  pageSub: css`margin-top: 4px; font-size: ${tk.textBase}; color: ${tk.textTertiary};`,
+  loadingWrap: css`display: flex; justify-content: center; padding: 80px 0;`,
+  emptyState: css`text-align: center; padding: 80px 0;`,
+  emptyTitle: css`font-size: ${tk.textLg}; font-weight: 600; color: ${tk.text}; margin-bottom: 6px;`,
+  emptyDesc: css`color: ${tk.textTertiary}; font-size: ${tk.textSm};`,
+  modalFoot: css`
+    display: flex; justify-content: space-between; align-items: center; gap: 10px;
+    padding: 14px 24px; border-top: 1px solid color-mix(in srgb, var(--foreground) 5%, transparent);
+  `,
+  footRight: css`display: flex; gap: 10px;`,
+  sectionTitle: css`
+    font-size: 11px; font-weight: 600; color: var(--text-muted);
+    text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 14px;
+  `,
+  // Group section styles (reused from skills page)
+  section: css`margin-bottom: 40px;`,
+  sectionHeader: css`
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 16px; padding-bottom: 12px; border-bottom: 1px solid color-mix(in srgb, var(--foreground) 8%, transparent);
+  `,
+  sectionGroupTitle: css`display: flex; align-items: center; gap: 8px; color: ${tk.text}; font-size: ${tk.textBase}; font-weight: 600;`,
+  sectionCount: css`
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 24px; height: 24px; padding: 0 8px;
+    background: ${tk.inkSubtle}; color: ${tk.ink}; border-radius: 12px;
+    font-size: 12px; font-weight: 600;
+  `,
+  toolbar: css`
+    display: flex; justify-content: space-between; align-items: center;
+    gap: 12px; margin-bottom: 16px;
+  `,
+  toolbarActions: css`
+    display: flex; align-items: center; gap: 8px;
+  `,
+}))
+
+export default function AgentListPage() {
+  const { t } = useTranslation()
+  const { styles } = useStyles()
+  const navigate = useNavigate()
+  const { data: agents = [], isLoading } = useAgents()
+  const { data: tools = [] } = useTools()
+  const canWrite = useCanWrite()
+  const { data: skills = [] } = useSkills()
+  const { data: providers = [] } = useProviders('chat')
+  const { data: mcps = [] } = useMcps()
+  const updateAgent = useUpdateAgent()
+  const deleteAgent = useDeleteAgent()
+  const updateSubagents = useUpdateSubagents()
+  const updateAgentTools = useUpdateAgentTools()
+  const updateAgentSkills = useUpdateAgentSkills()
+  const updateAgentMcps = useUpdateAgentMcps()
+  const probeAgent = useProbeAgent()
+
+  // Main form
+  const [formOpen, setFormOpen] = useState(false)
+  const [editingAgent, setEditingAgent] = useState<Agent | null>(null)
+
+  // Sub-resource modals
+  const [currentName, setCurrentName] = useState('')
+  const [currentAgent, setCurrentAgent] = useState<Agent | null>(null)
+  const [subagentOpen, setSubagentOpen] = useState(false)
+  const [toolOpen, setToolOpen] = useState(false)
+  const [skillOpen, setSkillOpen] = useState(false)
+  const [mcpOpen, setMcpOpen] = useState(false)
+  const [modelOpen, setModelOpen] = useState(false)
+  const [selectedSubagents, setSelectedSubagents] = useState<string[]>([])
+  const [selectedTools, setSelectedTools] = useState<string[]>([])
+  const [selectedSkills, setSelectedSkills] = useState<string[]>([])
+  const [selectedMcps, setSelectedMcps] = useState<string[]>([])
+  const [selectedProviderId, setSelectedProviderId] = useState<number | null>(null)
+  const [selectedModelId, setSelectedModelId] = useState<string>('')
+  const [selectedSelectionId, setSelectedSelectionId] = useState<string>('')
+  const [fieldValues, setFieldValues] = useState<Record<string, string>>({})
+  const [initialApiKey, setInitialApiKey] = useState<string>('') // masked api_key from backend
+  const [testPassed, setTestPassed] = useState(false)
+  const [testing, setTesting] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [modelDropdownOpen, setModelDropdownOpen] = useState(false)
+
+  // DeployModal state
+  const [deployOpen, setDeployOpen] = useState(false)
+  const [deployAgent, setDeployAgent] = useState<Agent | null>(null)
+
+  // Knowledge modal state
+  const [knowledgeOpen, setKnowledgeOpen] = useState(false)
+  const [knowledgeAgent, setKnowledgeAgent] = useState<Agent | null>(null)
+
+  // ===== 批量操作（#141 第一阶段 · 快速操作）=====
+  const bulkTask = useBulkAgentTask()
+  const [selectionMode, setSelectionMode] = useState(false)
+  const [rawSelectedNames, setRawSelectedNames] = useState<Set<string>>(new Set())
+  const [confirmState, setConfirmState] = useState<{ operation: BulkOperation; items: ClassifiedItem[] } | null>(null)
+  const [precheckingOp, setPrecheckingOp] = useState<BulkOperation | null>(null)
+  // 预检代次（review 复审 P2）：退出选择模式时 bump，进行中的预检完成后
+  // 发现代次不符即丢弃结果——退出后不再弹旧批次的确认弹窗
+  const precheckGenerationRef = useRef(0)
+
+  const toggleSelect = (name: string) => {
+    setRawSelectedNames((prev) => {
+      const next = new Set(prev)
+      if (next.has(name)) next.delete(name)
+      else next.add(name)
+      return next
+    })
+  }
+  const addNames = (names: string[]) => {
+    setRawSelectedNames((prev) => new Set([...prev, ...names]))
+  }
+
+  // 列表刷新后剔除已消失的选中项（spec §4.1 选择保留策略）——render-time state
+  // adjustment（React 官方模式，替代 effect 内 setState）：真正从 raw 集删除，
+  // 防止同名 Agent 重现时被静默复活选中（review P2b）
+  const validNames = useMemo(() => new Set(agents.map((a) => a.name)), [agents])
+  if (rawSelectedNames.size > 0) {
+    const kept = [...rawSelectedNames].filter((n) => validNames.has(n))
+    if (kept.length !== rawSelectedNames.size) {
+      setRawSelectedNames(new Set(kept))
+    }
+  }
+  const selectedNames = rawSelectedNames
+
+  const selectedAgents = useMemo(
+    () => agents.filter((a) => selectedNames.has(a.name)),
+    [agents, selectedNames],
+  )
+
+  const pendingUpdateCount = useMemo(
+    () => agents.filter(hasPendingArtifactUpdates).length,
+    [agents],
+  )
+
+  // 点批量操作：并发 5 路预检选中项 → 分类 → 确认弹窗（spec §4.2）。
+  // 预检互斥守卫（review P1）：进行中不接受第二个预检，防止竞争覆盖 confirmState。
+  const handleBulkOperation = async (op: BulkOperation) => {
+    if (bulkTask.phase === 'running' || precheckingOp !== null || selectedAgents.length === 0) return
+    const generation = precheckGenerationRef.current
+    setPrecheckingOp(op)
+    try {
+      const prechecks = new Map<string, PrecheckResult>()
+      const LIMIT = 5
+      for (let i = 0; i < selectedAgents.length; i += LIMIT) {
+        const chunk = selectedAgents.slice(i, i + LIMIT)
+        await Promise.all(chunk.map(async (a) => {
+          try {
+            const status = unwrapResponse<DeploymentStatus>(await agentApi.getDeployment(a.name))
+            prechecks.set(a.name, { kind: 'success', status })
+          } catch (err) {
+            prechecks.set(a.name, { kind: 'error', error: err })
+          }
+        }))
+      }
+      // 预检期间用户已退出选择模式 → 丢弃旧批次结果，不弹确认（review 复审 P2）
+      if (precheckGenerationRef.current !== generation) return
+      setConfirmState({ operation: op, items: classifyAllAgents(op, selectedAgents, prechecks) })
+    } finally {
+      setPrecheckingOp(null)
+    }
+  }
+
+  // 确认：启动批次；onFinished 清理成功项选中（spec §6 轻量重试路径）
+  const handleBulkConfirm = () => {
+    if (!confirmState) return
+    const { operation, items } = confirmState
+    bulkTask.start({
+      operation,
+      items,
+      onFinished: (succeeded) => {
+        setRawSelectedNames((prev) => new Set([...prev].filter((n) => !succeeded.includes(n))))
+      },
+    })
+    setConfirmState(null)
+  }
+
+  const exitSelectionMode = () => {
+    precheckGenerationRef.current++ // 使进行中的预检结果失效（review 复审 P2）
+    setSelectionMode(false)
+    setRawSelectedNames(new Set())
+  }
+
+  const settledCount = bulkTask.summary.succeeded + bulkTask.summary.failed
+    + bulkTask.summary.skipped + bulkTask.summary.blocked
+  const bubbleDot: 'green' | 'red' | null =
+    bulkTask.phase !== 'done' ? null
+      : (bulkTask.summary.failed > 0 || bulkTask.summary.blocked > 0 ? 'red' : 'green')
+
+  // 搜索
+  const [keywords, setKeywords] = useState('')
+
+  // 按关键词过滤
+  const filteredAgents = useMemo(() => {
+    if (!keywords) return agents
+    const kw = keywords.toLowerCase()
+    return agents.filter((agent) => {
+      const fields = [
+        agent.name,
+        agent.config.title?.zh,
+        agent.config.title?.en,
+        agent.config.description?.zh,
+        agent.config.description?.en,
+        agent.group
+      ]
+      return fields.some((f) => f?.toLowerCase().includes(kw))
+    })
+  }, [agents, keywords])
+
+  // 按 group 分组，组内按 name 排序（group 为 nullish 或空串/空白串都归「默认分组」——
+  // DB 列默认空字符串，?? 不会回退空串，必须显式判空）
+  const groupedAgents = useMemo(() => {
+    const grouped = filteredAgents.reduce<Record<string, Agent[] | undefined>>((acc, agent) => {
+      const group = agent.group?.trim() ? agent.group : '默认分组'
+      acc[group] ??= []
+      acc[group].push(agent)
+      return acc
+    }, {})
+    // 组内按标识首字母排序
+    Object.values(grouped).forEach((list) => (list ?? []).sort((a, b) => a.name.localeCompare(b.name)))
+    return grouped
+  }, [filteredAgents])
+
+  // 排序：默认分组放最后
+  const sortedGroups = useMemo(() => {
+    return Object.keys(groupedAgents).sort((a, b) => {
+      if (a === '默认分组') return 1
+      if (b === '默认分组') return -1
+      return a.localeCompare(b)
+    })
+  }, [groupedAgents])
+
+  const showDeploy = (agent: Agent) => {
+    setDeployAgent(agent)
+    setDeployOpen(true)
+  }
+
+  const showEdit = (agent: Agent) => { setEditingAgent(agent); setFormOpen(true) }
+  const showCreate = () => { setEditingAgent(null); setFormOpen(true) }
+
+  const handleEditSubagents = (agent: Agent) => {
+    setCurrentName(agent.name)
+    setSelectedSubagents([...(agent.subagents ?? [])])
+    setSubagentOpen(true)
+  }
+
+  const defaultToolNames = useMemo(() =>
+    new Set(tools.filter((t) => t.isDefault).map((t) => t.name)),
+  [tools])
+
+  const handleEditTools = async (agent: Agent) => {
+    setCurrentName(agent.name)
+    let names = agent.tools ?? []
+    try {
+      const res = await agentApi.getTools(agent.name)
+      const body = res.data as { success: boolean; data?: string[] }
+      if (body.success) names = body.data ?? []
+    } catch { /* use fallback */ }
+    const merged = Array.from(new Set([...names, ...defaultToolNames]))
+    setSelectedTools(merged)
+    setToolOpen(true)
+  }
+
+  const handleEditSkills = async (agent: Agent) => {
+    setCurrentName(agent.name)
+    let names = agent.skills ?? []
+    try {
+      const res = await agentApi.getSkills(agent.name)
+      const body = res.data as { success: boolean; data?: string[] }
+      if (body.success) names = body.data ?? []
+    } catch { /* use fallback */ }
+    setSelectedSkills([...names])
+    setSkillOpen(true)
+  }
+
+  const handleEditMcps = async (agent: Agent) => {
+    setCurrentName(agent.name)
+    let names = agent.mcps ?? []
+    try {
+      const res = await agentApi.getMcps(agent.name)
+      const body = res.data as { success: boolean; data?: string[] }
+      if (body.success) names = body.data ?? []
+    } catch { /* use fallback */ }
+    setSelectedMcps([...names])
+    setMcpOpen(true)
+  }
+
+  const handleEditKnowledge = (agent: Agent) => {
+    setKnowledgeAgent(agent)
+    setKnowledgeOpen(true)
+  }
+
+  const handleEditModel = (agent: Agent) => {
+    setCurrentName(agent.name)
+    setCurrentAgent(agent)
+    const pid = agent.config.providerId ?? null
+    const mid = agent.config.modelId ?? ''
+    const sid = agent.config.modelSelectionId ?? ''
+    setSelectedProviderId(pid)
+    setSelectedModelId(mid)
+    setSelectedSelectionId(sid)
+    setTestPassed(false)
+    setTesting(false)
+    setSaving(false)
+
+    // Initialize fieldValues: prefer agent's existing overrides, fallback to Provider values
+    const initial: Record<string, string> = {}
+    const provider = providers.find(p => p.id === pid)
+    if (provider) {
+      for (const f of provider.fields) {
+        const override = agent.config.fieldOverrides?.[f.key]
+        if (override !== undefined) {
+          initial[f.key] = override
+        } else if (f.key === 'name') {
+          initial[f.key] = provider.name
+        } else if (f.key === 'base_url') {
+          initial[f.key] = provider.baseUrl
+        }
+      }
+    }
+    // api_key comes back masked from the backend; show it so the user knows
+    // a key is configured, but skip it on save/test unless changed.
+    const maskedApiKey = agent.config.fieldOverrides?.api_key
+    setInitialApiKey(maskedApiKey ?? '')
+    if (maskedApiKey) {
+      initial.api_key = maskedApiKey
+    }
+    setFieldValues(initial)
+    setModelOpen(true)
+  }
+
+  const updateField = (key: string, value: string) => {
+    setFieldValues(prev => ({ ...prev, [key]: value }))
+    setTestPassed(false)
+  }
+
+  const handleProviderChange = (value: number | undefined) => {
+    setTestPassed(false)
+
+    if (!value) {
+      setSelectedProviderId(null)
+      setSelectedModelId('')
+      setFieldValues({})
+      setInitialApiKey('')
+      return
+    }
+
+    const newProvider = providers.find(p => p.id === value)
+
+    // Re-fill fields from new Provider defaults (api_key left empty)
+    const initial: Record<string, string> = {}
+    if (newProvider) {
+      for (const f of newProvider.fields) {
+        if (f.key === 'api_key') continue
+        if (f.key === 'name') initial[f.key] = newProvider.name
+        else if (f.key === 'base_url') initial[f.key] = newProvider.baseUrl
+      }
+    }
+
+    setInitialApiKey('')
+    setSelectedProviderId(value)
+    setSelectedModelId('')
+    setSelectedSelectionId('')
+    setFieldValues(initial)
+  }
+
+  // AutoComplete 选项的 value 用 selectionId（区分同 modelId 的多条 catalog 记录，
+  // 如 kimi-cn 的 k3 256K 与 k3 1M）。当用户从下拉选中一项时，同步设置 modelId
+  // 和 selectionId；用户自定义输入（无匹配建议）时，selectionId 置空，只存 modelId
+  // 兼容运行时直接传任意模型 ID 的场景。
+  const handleModelChange = (value: string) => {
+    setTestPassed(false)
+    const hit = modelSuggestions.find((m) => m.value === value)
+    if (hit) {
+      setSelectedModelId(hit.modelId)
+      setSelectedSelectionId(hit.selectionId ?? '')
+    } else {
+      setSelectedModelId(value)
+      setSelectedSelectionId('')
+    }
+    if (!value) {
+      setModelDropdownOpen(false)
+    }
+  }
+
+  const canTest = !!selectedProviderId && !!selectedModelId && !testing
+
+  const handleTest = async () => {
+    if (!selectedProviderId || !selectedModelId || !currentName) return
+
+    setTesting(true)
+    try {
+      // Send the current form values; backend resolves masked values against
+      // the Agent's fieldOverrides or the Provider's stored key.
+      const res = await probeAgent.mutateAsync({
+        name: currentName,
+        data: {
+          providerId: selectedProviderId,
+          apiKey: fieldValues.api_key || '',
+          baseUrl: fieldValues.base_url || '',
+        },
+      })
+      const result = (res.data as ApiEnvelope<{ success?: boolean; latencyMs?: number; error?: string }>).data
+      if (result?.success) {
+        message.success(t('providers.connectSuccess', { ms: result.latencyMs }))
+        setTestPassed(true)
+      } else {
+        message.error(t('providers.connectFail', { error: result?.error ?? t('providers.unknownError') }))
+        setTestPassed(false)
+      }
+    } catch {
+      setTestPassed(false)
+    } finally {
+      setTesting(false)
+    }
+  }
+
+  const canConfirm = testPassed && !!selectedProviderId && !!selectedModelId && !saving
+
+  const handleSave = async () => {
+    if (!currentAgent) return
+    setSaving(true)
+    try {
+      // Strip api_key if it is the same masked value from the backend;
+      // the backend uses the Provider's stored key when no override is present.
+      const overrides = { ...fieldValues }
+      if (overrides.api_key === initialApiKey) {
+        delete overrides.api_key
+      }
+      await updateAgent.mutateAsync({
+        name: currentName,
+        data: {
+          config: {
+            ...currentAgent.config,
+            providerId: selectedProviderId,
+            modelId: selectedModelId,
+            modelSelectionId: selectedSelectionId,
+            fieldOverrides: overrides,
+          }
+        }
+      })
+      setModelOpen(false)
+    } catch (err: unknown) {
+      const errMsg = err instanceof Error ? err.message : t('providers.unknownError')
+      message.error(t('agents.saveFail', { error: errMsg }))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  // Options for selects
+  const subagentOptions = agents
+    .filter((a) => a.name !== currentName)
+    .map((a) => ({ value: a.name, label: a.config.title?.zh ?? a.config.title?.en ?? a.name }))
+
+  const toolOptions = buildToolOptions(tools, selectedTools, defaultToolNames)
+
+  const mcpOptions = mcps.map((m) => ({
+    value: m.name,
+    label: m.title || m.name,
+  }))
+
+  const skillOptions = (() => {
+    const expert = skills.filter((s) => s.type === 'expert').map((s) => ({ value: s.name, label: s.name }))
+    const community = skills.filter((s) => s.type === 'community').map((s) => ({ value: s.name, label: s.name }))
+    const groups: { label: string; options: { value: string; label: string }[] }[] = []
+    if (expert.length) groups.push({ label: t('skills.expertSection'), options: expert })
+    if (community.length) groups.push({ label: t('skills.communitySection'), options: community })
+    return groups
+  })()
+
+  // Provider options for the first Select
+  const providerOptions = providers.map(p => ({ value: p.id, label: p.name }))
+
+  // Protocol → display metadata. Used by the provider dropdown's optionRender
+  // to append a colored protocol tag after each provider name.
+  const protocolMeta: Partial<Record<string, { label: string; color: string }>> = {
+    anthropic: { label: 'Anthropic', color: 'orange' },
+    openai: { label: 'OpenAI', color: 'emerald' },
+    mineru: { label: 'MinerU', color: 'geekblue' },
+    paddleocr: { label: 'PaddleOCR', color: 'purple' },
+  }
+  const renderProtocolTag = (protocol: string) => {
+    const meta = protocolMeta[protocol]
+    if (!meta) return null
+    return (
+      <Tag
+        color={meta.color}
+        style={{ marginLeft: 8, marginRight: 0, fontSize: 11, lineHeight: '18px', padding: '0 6px' }}
+      >
+        {meta.label}
+      </Tag>
+    )
+  }
+
+  // Model suggestions from the selected Provider's defaultModels.
+  // Only LLM and VLM models are eligible for agent binding (defense-in-depth
+  // alongside the backend validator); embedding/OCR models are excluded.
+  // option.value 用 selectionId（区分同 modelId 的多条 catalog 记录）。
+  const modelSuggestions = (() => {
+    const provider = providers.find(p => p.id === selectedProviderId)
+    if (!provider) return []
+    return provider.defaultModels
+      .filter((m) => m.modelType === 'llm' || m.modelType === 'vlm')
+      .map(m => ({
+        value: m.selectionId ?? m.modelId,
+        selectionId: m.selectionId,
+        modelId: m.modelId,
+        label: `${m.displayName || m.modelId} (${m.modelId})`,
+        display: m.displayName || m.modelId,
+      }))
+  })()
+
+  // 当前选中的建议项：优先用 selectionId 命中（新绑定），否则用 modelId 命中
+  // （兼容只有 modelId 的存量 agent 与自定义输入）。
+  const selectedModelSuggestion = useMemo(
+    () => modelSuggestions.find(m => (selectedSelectionId ? m.selectionId === selectedSelectionId : m.value === selectedModelId)),
+    [modelSuggestions, selectedSelectionId, selectedModelId],
+  )
+
+  // Reverse-lookup map: 主键 `providerId::selectionId`，次键 `providerId::modelId`
+  // （兼容存量 agent 没存 selectionId 的情况；同 modelId 多条记录时取最后一条）。
+  const modelDisplayNameMap = useMemo(() => {
+    const bySelection = new Map<string, string>()
+    const byModel = new Map<string, string>()
+    for (const p of providers) {
+      for (const mo of p.defaultModels) {
+        if (mo.selectionId) {
+          bySelection.set(`${p.id}::${mo.selectionId}`, mo.displayName)
+        }
+        byModel.set(`${p.id}::${mo.modelId}`, mo.displayName)
+      }
+    }
+    return { bySelection, byModel }
+  }, [providers])
+
+  const getModelDisplayName = (agent: Agent): string => {
+    const pid = agent.config.providerId
+    const mid = agent.config.modelId ?? ''
+    const sid = agent.config.modelSelectionId ?? ''
+    if (!pid || !mid) return ''
+    if (sid) {
+      const name = modelDisplayNameMap.bySelection.get(`${pid}::${sid}`)
+      if (name) return name
+    }
+    return modelDisplayNameMap.byModel.get(`${pid}::${mid}`) ?? mid
+  }
+
+  return (
+    <div className={styles.page}>
+      <div className={styles.pageHead}>
+        <div>
+          <div className={styles.pageTitle}>{t('agents.pageTitle')}</div>
+          <div className={styles.pageSub}>{t('agents.pageSub')}</div>
+        </div>
+        {canWrite && (
+          <PrimaryButton icon={<PlusIcon size={16} weight="bold" />} onClick={showCreate}>
+            {t('agents.create')}
+          </PrimaryButton>
+        )}
+      </div>
+
+      <div className={styles.toolbar}>
+        <NameSearch
+          placeholder={t('agents.searchPlaceholder')}
+          onSearch={setKeywords}
+          realtime
+        />
+        <div className={styles.toolbarActions}>
+          {/* 开始对话：新页签打开聊天总览（member 只读也可聊，不受 canWrite 限制） */}
+          {!selectionMode && (
+            <Button
+              icon={<ChatCircleDotsIcon size={14} />}
+              onClick={() => { window.open('/static/agents/chat', '_blank', 'noopener,noreferrer'); }}
+            >
+              {t('agents.startChat')}
+            </Button>
+          )}
+          {selectionMode && canWrite ? (
+            <BulkActionBar
+              selectedCount={selectedNames.size}
+              pendingUpdateCount={pendingUpdateCount}
+              onSelectAll={() => { addNames(filteredAgents.map((a) => a.name)); }}
+              onSelectPendingUpdates={() => { addNames(agents.filter(hasPendingArtifactUpdates).map((a) => a.name)); }}
+              onClear={() => { setRawSelectedNames(new Set()); }}
+              onOperation={(op) => { void handleBulkOperation(op); }}
+              onExit={exitSelectionMode}
+              operationsDisabled={bulkTask.phase === 'running'}
+              prechecking={precheckingOp}
+            />
+          ) : (
+            canWrite && (
+              <Button
+                icon={<CheckSquareIcon size={14} />}
+                onClick={() => { setRawSelectedNames(new Set()); setSelectionMode(true); }}
+              >
+                {t('agents.bulkOps')}
+              </Button>
+            )
+          )}
+        </div>
+      </div>
+
+      {isLoading ? (
+        <div className={styles.loadingWrap}><Spin size="medium" /></div>
+      ) : agents.length === 0 ? (
+        <div className={styles.emptyState}>
+          <div style={{ marginBottom: 20 }}><SquaresFourIcon size={48} weight="thin" color={tk.textMuted} /></div>
+          <div className={styles.emptyTitle}>{t('agents.emptyTitle')}</div>
+          <div className={styles.emptyDesc}>{t('agents.emptyDesc')}</div>
+        </div>
+      ) : (
+        sortedGroups.map(group => (
+          <div key={group} className={styles.section}>
+            <div className={styles.sectionHeader}>
+              <div className={styles.sectionGroupTitle}>
+                <span>{group === '默认分组' ? t('agents.defaultGroup') : group}</span>
+                <span className={styles.sectionCount}>{(groupedAgents[group] ?? []).length}</span>
+              </div>
+              {selectionMode && canWrite && (
+                <Button
+                  type="link"
+                  size="small"
+                  onClick={() => { addNames((groupedAgents[group] ?? []).map((a) => a.name)); }}
+                >
+                  {t('agents.selectAllInGroup')}
+                </Button>
+              )}
+            </div>
+            <CardGrid>
+              {(groupedAgents[group] ?? []).map((agent) => (
+                <AgentCard
+                  key={agent.name}
+                  agent={agent}
+                  modelDisplayName={getModelDisplayName(agent)}
+                  canWrite={canWrite}
+                  onEdit={showEdit}
+                  onDelete={(name) => { deleteAgent.mutate(name); }}
+                  onEditSubagents={handleEditSubagents}
+                  onEditTools={handleEditTools}
+                  onEditSkills={handleEditSkills}
+                  onEditMcps={handleEditMcps}
+                  onEditModel={handleEditModel}
+                  onDeploy={showDeploy}
+                  onEditKnowledge={handleEditKnowledge}
+                  onViewRelations={(item) => { void navigate(`/relations?agent=${item.id}`) }}
+                  selectionMode={selectionMode && canWrite}
+                  selected={selectedNames.has(agent.name)}
+                  onToggleSelect={toggleSelect}
+                />
+              ))}
+            </CardGrid>
+          </div>
+        ))
+      )}
+
+      <AgentForm open={formOpen} editingAgent={editingAgent} onClose={() => { setFormOpen(false); }} />
+
+      {deployAgent && (
+        <DeployModal
+          agent={deployAgent}
+          providers={providers}
+          open={deployOpen}
+          onClose={() => {
+            setDeployOpen(false)
+            setDeployAgent(null)
+          }}
+        />
+      )}
+
+      {knowledgeOpen && knowledgeAgent && (
+        <AgentKnowledgeModal
+          open={knowledgeOpen}
+          agent={knowledgeAgent}
+          canWrite={canWrite}
+          onClose={() => {
+            setKnowledgeOpen(false)
+            setKnowledgeAgent(null)
+          }}
+        />
+      )}
+
+      {/* Sub-agents modal */}
+      <Modal
+        title={t('agents.modals.subagentTitle')}
+        open={subagentOpen}
+        onCancel={() => { setSubagentOpen(false); }}
+        width={480}
+        footer={
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10 }}>
+            <Button onClick={() => { setSubagentOpen(false); }}>{t('common.cancel')}</Button>
+            {canWrite && (
+              <PrimaryButton
+                loading={updateSubagents.isPending}
+                onClick={async () => {
+                  await updateSubagents.mutateAsync({ name: currentName, subagents: selectedSubagents })
+                  setSubagentOpen(false)
+                }}
+              >
+                {t('agents.modals.confirm')}
+              </PrimaryButton>
+            )}
+          </div>
+        }
+      >
+        <p style={{ marginBottom: 14, fontSize: 13, color: 'var(--text-secondary)' }}>{t('agents.modals.subagentHint')}</p>
+        <Select
+          mode="multiple"
+          style={{ width: '100%' }}
+          placeholder={t('agents.modals.subagentPh')}
+          options={subagentOptions}
+          size="large"
+          value={selectedSubagents}
+          onChange={setSelectedSubagents}
+          disabled={!canWrite}
+        />
+      </Modal>
+
+      {/* Tools modal */}
+      <Modal
+        title={t('agents.modals.toolTitle')}
+        open={toolOpen}
+        onCancel={() => { setToolOpen(false); }}
+        width={480}
+        footer={
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10 }}>
+            <Button onClick={() => { setToolOpen(false); }}>{t('common.cancel')}</Button>
+            {canWrite && (
+              <PrimaryButton
+                loading={updateAgentTools.isPending}
+                onClick={async () => {
+                  const merged = Array.from(new Set([...selectedTools, ...defaultToolNames]))
+                  await updateAgentTools.mutateAsync({ name: currentName, toolNames: merged })
+                  setToolOpen(false)
+                }}
+              >
+                {t('agents.modals.confirm')}
+              </PrimaryButton>
+            )}
+          </div>
+        }
+      >
+        <p style={{ marginBottom: 14, fontSize: 13, color: 'var(--text-secondary)' }}>{t('agents.modals.toolHint')}</p>
+        <Select
+          mode="multiple"
+          style={{ width: '100%' }}
+          placeholder={t('agents.modals.toolPh')}
+          options={toolOptions}
+          size="large"
+          value={selectedTools}
+          onChange={setSelectedTools}
+          disabled={!canWrite}
+        />
+      </Modal>
+
+      {/* Skills modal */}
+      <Modal
+        title={t('agents.modals.skillTitle')}
+        open={skillOpen}
+        onCancel={() => { setSkillOpen(false); }}
+        width={480}
+        footer={
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10 }}>
+            <Button onClick={() => { setSkillOpen(false); }}>{t('common.cancel')}</Button>
+            {canWrite && (
+              <PrimaryButton
+                loading={updateAgentSkills.isPending}
+                onClick={async () => {
+                  await updateAgentSkills.mutateAsync({ name: currentName, skillNames: selectedSkills })
+                  setSkillOpen(false)
+                }}
+              >
+                {t('agents.modals.confirm')}
+              </PrimaryButton>
+            )}
+          </div>
+        }
+      >
+        <p style={{ marginBottom: 14, fontSize: 13, color: 'var(--text-secondary)' }}>
+          t('agents.modals.skillHint')
+        </p>
+        <Select
+          mode="multiple"
+          style={{ width: '100%' }}
+          placeholder={t('agents.modals.skillPh')}
+          options={skillOptions}
+          size="large"
+          value={selectedSkills}
+          onChange={setSelectedSkills}
+          disabled={!canWrite}
+        />
+      </Modal>
+
+      {/* MCPs modal */}
+      <Modal
+        title={t('agents.modals.mcpTitle')}
+        open={mcpOpen}
+        onCancel={() => { setMcpOpen(false); }}
+        width={480}
+        footer={
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10 }}>
+            <Button onClick={() => { setMcpOpen(false); }}>{t('common.cancel')}</Button>
+            {canWrite && (
+              <PrimaryButton
+                loading={updateAgentMcps.isPending}
+                onClick={async () => {
+                  await updateAgentMcps.mutateAsync({ agentName: currentName, mcpNames: selectedMcps })
+                  setMcpOpen(false)
+                }}
+              >
+                {t('agents.modals.confirm')}
+              </PrimaryButton>
+            )}
+          </div>
+        }
+      >
+        <p style={{ marginBottom: 14, fontSize: 13, color: 'var(--text-secondary)' }}>
+          t('agents.modals.mcpHint')
+        </p>
+        {mcps.length === 0 ? (
+          <Empty description={t('agents.modals.mcpEmpty')} />
+        ) : (
+          <Select
+            mode="multiple"
+            style={{ width: '100%' }}
+            placeholder={t('agents.modals.mcpPh')}
+            options={mcpOptions}
+            size="large"
+            value={selectedMcps}
+            onChange={setSelectedMcps}
+            disabled={!canWrite}
+          />
+        )}
+      </Modal>
+
+      {/* Model modal */}
+      <Modal
+        title={t('agents.modals.modelTitle')}
+        open={modelOpen}
+        onCancel={() => { setModelOpen(false); }}
+        footer={
+          <div className={styles.modalFoot}>
+            <Button onClick={() => { setModelOpen(false); }}>{t('common.cancel')}</Button>
+            {canWrite && (
+              <div className={styles.footRight}>
+                <Button onClick={handleTest} disabled={!canTest} loading={testing}>
+                  <PlugIcon size={14} /> {t('agents.modals.test')}
+                </Button>
+                <PrimaryButton onClick={handleSave} disabled={!canConfirm} loading={saving}>
+                  {t('agents.modals.confirm')}
+                </PrimaryButton>
+              </div>
+            )}
+          </div>
+        }
+        width={720}
+        destroyOnHidden
+      >
+        {providers.length === 0 ? (
+          <Empty description={t('agents.modals.modelEmpty')} />
+        ) : (
+          <>
+            {/* Provider/Model offline warning */}
+            {(() => {
+              const pid = currentAgent?.config.providerId
+              const mid = currentAgent?.config.modelId
+              const sid = currentAgent?.config.modelSelectionId
+              if (!pid || !mid) return null
+              // 优先用 selectionId 命中（精确），否则用 modelId 兜底（兼容存量）
+              const hit = sid
+                ? modelDisplayNameMap.bySelection.has(`${pid}::${sid}`)
+                : modelDisplayNameMap.byModel.has(`${pid}::${mid}`)
+              if (!hit) {
+                return (
+                  <p style={{ marginBottom: 14, fontSize: 13, color: '#dc2626' }}>
+                    t('agents.modals.offlineWarning')
+                  </p>
+                )
+              }
+              return null
+            })()}
+
+            {/* Provider Select */}
+            <div style={{ marginBottom: 20 }}>
+              <label style={{ display: 'block', marginBottom: 6, fontSize: 13, color: 'var(--text-secondary)' }}>
+                {t('agents.modals.selectProvider')}
+              </label>
+              <Select
+                style={{ width: '100%' }}
+                size="large"
+                placeholder={t('agents.modals.selectProviderPh')}
+                allowClear
+                value={selectedProviderId ?? undefined}
+                onChange={handleProviderChange}
+                options={providerOptions}
+                disabled={!canWrite}
+                optionRender={(option) => {
+                  const provider = providers.find(p => p.id === option.value)
+                  return (
+                    <span style={{ display: 'inline-flex', alignItems: 'center' }}>
+                      {option.label}
+                      {provider && renderProtocolTag(provider.protocol)}
+                    </span>
+                  )
+                }}
+              />
+            </div>
+
+            {/* Model AutoComplete */}
+            {selectedProviderId && (
+              <div style={{ marginBottom: 20 }}>
+                <label style={{ display: 'block', marginBottom: 6, fontSize: 13, color: 'var(--text-secondary)' }}>
+                  {t('agents.modals.selectOrInputModel')}
+                </label>
+                <AutoComplete
+                  style={{ width: '100%' }}
+                  size="large"
+                  placeholder={t('agents.modals.selectModelPh')}
+                  disabled={!canWrite}
+                  value={modelDropdownOpen || !selectedModelSuggestion ? selectedModelId : selectedModelSuggestion.display}
+                  onChange={(value) => {
+                    handleModelChange(value)
+                    setModelDropdownOpen(false)
+                  }}
+                  options={modelSuggestions}
+                  allowClear
+                  showSearch={{
+                    filterOption: (input, option) => {
+                      const value = (option?.value ?? '').toLowerCase()
+                      const label = (option?.label ?? '').toLowerCase()
+                      const query = input.toLowerCase()
+                      return value.includes(query) || label.includes(query)
+                    },
+                    onSearch: (value) => {
+                      const query = value.toLowerCase()
+                      const hasMatch = modelSuggestions.some(m =>
+                        m.value.toLowerCase().includes(query) ||
+                        m.label.toLowerCase().includes(query)
+                      )
+                      setModelDropdownOpen(hasMatch)
+                    },
+                  }}
+                  open={modelDropdownOpen}
+                  onBlur={() => { setModelDropdownOpen(false); }}
+                  onFocus={() => { setModelDropdownOpen(modelSuggestions.length > 0); }}
+                  onSelect={() => { setModelDropdownOpen(false); }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      setModelDropdownOpen(false)
+                    }
+                  }}
+                />
+              </div>
+            )}
+
+            {/* Dynamic fields based on Provider.fields */}
+            {(() => {
+              const selectedProvider = providers.find(p => p.id === selectedProviderId)
+              if (!selectedProvider) return null
+
+              if (selectedProvider.fields.length === 0) {
+                return (
+                  <p style={{ fontSize: 13, color: 'var(--text-muted)' }}>
+                    t('agents.modals.noConnParams')
+                  </p>
+                )
+              }
+
+              return (
+                <>
+                  <div className={styles.sectionTitle}>{t('agents.modals.connSection')}</div>
+                  {selectedProvider.fields.map((field) => (
+                    <div key={field.key} style={{ marginBottom: 16 }}>
+                      <label style={{ display: 'block', marginBottom: 6, fontSize: 13, color: 'var(--text-secondary)' }}>
+                        {field.label}
+                        {field.required && <span style={{ color: '#dc2626', marginLeft: 4 }}>*</span>}
+                      </label>
+                {field.type === 'password' ? (
+                  <Input
+                    value={fieldValues[field.key] ?? ''}
+                    onChange={(e) => { updateField(field.key, e.target.value); }}
+                    placeholder={t('agents.modals.inputPh', { label: field.label })}
+                    disabled={!canWrite}
+                  />
+                ) : field.type === 'select' ? (
+                  <Select
+                    value={fieldValues[field.key] ?? undefined}
+                    onChange={(v) => { updateField(field.key, v); }}
+                    placeholder={t('agents.modals.selectPh', { label: field.label })}
+                    style={{ width: '100%' }}
+                    options={[]}
+                    disabled={!canWrite}
+                  />
+                ) : (
+                  <Input
+                    value={fieldValues[field.key] ?? ''}
+                    onChange={(e) => { updateField(field.key, e.target.value); }}
+                    placeholder={t('agents.modals.inputPh', { label: field.label })}
+                    disabled={!canWrite}
+                  />
+                )}
+                    </div>
+                  ))}
+                </>
+              )
+            })()}
+          </>
+        )}
+      </Modal>
+      <ExtensionSlotRenderer slot="agent.detail.tab" />
+
+      <BulkConfirmModal
+        open={confirmState !== null}
+        operation={confirmState?.operation ?? 'deploy'}
+        items={confirmState?.items ?? []}
+        onCancel={() => { setConfirmState(null); }}
+        onConfirm={handleBulkConfirm}
+      />
+
+      <BulkTaskModal
+        open={bulkTask.phase !== 'idle' && bulkTask.presentation === 'modal-open'}
+        phase={bulkTask.phase}
+        operation={bulkTask.operation}
+        items={bulkTask.items}
+        summary={bulkTask.summary}
+        onCollapse={bulkTask.collapse}
+        onClose={bulkTask.close}
+      />
+
+      <BulkTaskBubble
+        visible={bulkTask.phase !== 'idle' && bulkTask.presentation === 'collapsed'}
+        phase={bulkTask.phase}
+        progressText={`${settledCount}/${bulkTask.summary.total}`}
+        dot={bubbleDot}
+        onClick={bulkTask.reopen}
+      />
+      <ExtensionSlotRenderer slot="agent.detail.tab" />
+    </div>
+  )
+}

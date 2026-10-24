@@ -1,0 +1,472 @@
+package handler
+
+import (
+	"errors"
+	"fmt"
+	"log"
+	"net/http"
+	"strconv"
+
+	"control-panel/internal/application/services"
+	"control-panel/internal/domain/audit"
+	"control-panel/internal/domain/provider"
+	"control-panel/internal/domain/tenant"
+
+	"github.com/gin-gonic/gin"
+)
+
+// ProviderHandler handles HTTP requests for vendor preset CRUD and probing.
+type ProviderHandler struct {
+	service        *services.ProviderService
+	multiragClient provider.MultiRAGClient
+	audit          *services.AuditRecorder
+}
+
+// NewProviderHandler wires a ProviderHandler. multiragClient is the
+// provider.MultiRAGClient used by SyncToMultiRAG; pass nil when MultiRAG
+// is not configured (the endpoint will then return 503).
+func NewProviderHandler(service *services.ProviderService, multiragClient provider.MultiRAGClient, ar *services.AuditRecorder) *ProviderHandler {
+	return &ProviderHandler{service: service, multiragClient: multiragClient, audit: ar}
+}
+
+// respondProviderError 映射 Provider 领域错误（issue #95 P2：英文化后
+// 内部诊断只进服务端日志，HTTP 边界返回中性中文文案，不向用户泄漏
+// DB/加解密等底层细节）。领域 sentinel 走用户面文案（404/503），
+// 用户面校验错误（ValidationError）保留 400 原文，其余一律 500 中性，
+// 完整错误链由服务端日志承载。
+func respondProviderError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, provider.ErrProviderNotFound):
+		respondError(c, http.StatusNotFound, err.Error())
+	case errors.Is(err, provider.ErrMultiRAGConfigMissing):
+		respondError(c, http.StatusServiceUnavailable, "MultiRAG 未配置")
+	default:
+		var ve *provider.ValidationError
+		if errors.As(err, &ve) {
+			// 返回完整错误链（err.Error() 而非 ve.Error()）：批量校验的
+			// 外层 wrap 携带模型索引/名称上下文（defaultModels[i](id)），
+			// 只取内层消息会丢失用户识别目标（review #5599426234 P3）。
+			respondError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		log.Printf("[ProviderHandler] internal error: %v", err)
+		respondError(c, http.StatusInternalServerError, "服务器内部错误，请稍后重试")
+	}
+}
+
+// ── Public endpoints (for Electron app, JWTAuth required) ───────
+
+func (h *ProviderHandler) List(c *gin.Context) {
+	typeFilter, ok := parseTypeQuery(c)
+	if !ok {
+		return
+	}
+	providers, err := h.service.ListAll(tenant.GetTenantID(c), typeFilter)
+	if err != nil {
+		respondProviderError(c, err)
+		return
+	}
+
+	items := make([]*services.ProviderDTO, 0, len(providers))
+	for _, p := range providers {
+		dto, err := h.service.ToDTO(tenant.GetTenantID(c), p)
+		if err != nil {
+			respondProviderError(c, err)
+			return
+		}
+		items = append(items, dto)
+	}
+	respondSuccess(c, items)
+}
+
+func (h *ProviderHandler) Get(c *gin.Context) {
+	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil {
+		respondError(c, http.StatusBadRequest, "invalid id")
+		return
+	}
+
+	p, err := h.service.GetByID(tenant.GetTenantID(c), id)
+	if err != nil {
+		respondProviderError(c, err)
+		return
+	}
+
+	dto, err := h.service.ToDTO(tenant.GetTenantID(c), p)
+	if err != nil {
+		respondProviderError(c, err)
+		return
+	}
+	respondSuccess(c, dto)
+}
+
+// ── Admin CRUD ──────────────────────────────────────────────────
+
+func (h *ProviderHandler) ListAdmin(c *gin.Context) {
+	typeFilter, ok := parseTypeQuery(c)
+	if !ok {
+		return
+	}
+	providers, err := h.service.ListAll(tenant.GetTenantID(c), typeFilter)
+	if err != nil {
+		respondProviderError(c, err)
+		return
+	}
+
+	items := make([]*services.ProviderDTO, 0, len(providers))
+	for _, p := range providers {
+		dto, err := h.service.ToDTO(tenant.GetTenantID(c), p)
+		if err != nil {
+			respondProviderError(c, err)
+			return
+		}
+		items = append(items, dto)
+	}
+	respondSuccess(c, items)
+}
+
+// parseTypeQuery validates the optional ?type= query param shared by the
+// list endpoints. Returns ok=false after writing the 400 response.
+func parseTypeQuery(c *gin.Context) (typeFilter string, ok bool) {
+	typeFilter = c.Query("type")
+	if typeFilter != "" && typeFilter != string(provider.TypeLLM) && typeFilter != string(provider.TypeOCR) && typeFilter != string(provider.TypeEmbedding) && typeFilter != string(provider.TypeVLM) && typeFilter != "chat" {
+		respondError(c, http.StatusBadRequest, fmt.Sprintf("type 不支持: %s（可选: llm, ocr, embedding, vlm, chat）", typeFilter))
+		return "", false
+	}
+	return typeFilter, true
+}
+
+type createProviderRequest struct {
+	Key           string                        `json:"key" binding:"required"`
+	Name          string                        `json:"name" binding:"required"`
+	Description   string                        `json:"description"`
+	DescriptionEn string                        `json:"descriptionEn"`
+	Protocol      string                        `json:"protocol" binding:"required"`
+	AuthStyle     string                        `json:"authStyle" binding:"required"`
+	BaseURL       string                        `json:"baseUrl"`
+	DefaultModels []provider.CatalogModel       `json:"defaultModels"`
+	Fields        []provider.PresetField        `json:"fields"`
+	IconKey       string                        `json:"iconKey"`
+	Builtin       bool                          `json:"builtin"`
+	Attributes    map[string]provider.AttrValue `json:"attributes"`
+	LockedAPIKey  string                        `json:"lockedApiKey"`
+}
+
+func (h *ProviderHandler) Create(c *gin.Context) {
+	var req createProviderRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		respondError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	dto, err := h.service.Create(tenant.GetTenantID(c), &services.CreateProviderInput{
+		Key:           req.Key,
+		Name:          req.Name,
+		Description:   req.Description,
+		DescriptionEn: req.DescriptionEn,
+		Protocol:      req.Protocol,
+		AuthStyle:     req.AuthStyle,
+		BaseURL:       req.BaseURL,
+		DefaultModels: req.DefaultModels,
+		Fields:        req.Fields,
+		IconKey:       req.IconKey,
+		Builtin:       req.Builtin,
+		Attributes:    req.Attributes,
+		LockedAPIKey:  req.LockedAPIKey,
+	})
+	if err != nil {
+		respondProviderError(c, err)
+		return
+	}
+	respondCreated(c, dto)
+}
+
+type updateProviderRequest struct {
+	Name          *string                       `json:"name"`
+	Description   *string                       `json:"description"`
+	DescriptionEn *string                       `json:"descriptionEn"`
+	Protocol      *string                       `json:"protocol"`
+	AuthStyle     *string                       `json:"authStyle"`
+	BaseURL       *string                       `json:"baseUrl"`
+	DefaultModels *[]provider.CatalogModel      `json:"defaultModels"`
+	Fields        *[]provider.PresetField       `json:"fields"`
+	IconKey       *string                       `json:"iconKey"`
+	Builtin       *bool                         `json:"builtin"`
+	Attributes    map[string]provider.AttrValue `json:"attributes"`
+	LockedAPIKey  *string                       `json:"lockedApiKey"`
+}
+
+func (h *ProviderHandler) Update(c *gin.Context) {
+	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil {
+		respondError(c, http.StatusBadRequest, "invalid id")
+		return
+	}
+
+	var req updateProviderRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		respondError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	dto, err := h.service.Update(tenant.GetTenantID(c), id, &services.UpdateProviderInput{
+		Name:          req.Name,
+		Description:   req.Description,
+		DescriptionEn: req.DescriptionEn,
+		Protocol:      req.Protocol,
+		AuthStyle:     req.AuthStyle,
+		BaseURL:       req.BaseURL,
+		DefaultModels: req.DefaultModels,
+		Fields:        req.Fields,
+		IconKey:       req.IconKey,
+		Builtin:       req.Builtin,
+		Attributes:    req.Attributes,
+		LockedAPIKey:  req.LockedAPIKey,
+	})
+	if err != nil {
+		respondProviderError(c, err)
+		return
+	}
+	respondSuccess(c, dto)
+}
+
+func (h *ProviderHandler) Delete(c *gin.Context) {
+	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil {
+		respondError(c, http.StatusBadRequest, "invalid id")
+		return
+	}
+
+	if err := h.service.Delete(tenant.GetTenantID(c), id); err != nil {
+		respondProviderError(c, err)
+		return
+	}
+	respondMessage(c, http.StatusOK, "Provider 已删除")
+}
+
+// ── Probe ───────────────────────────────────────────────────────
+
+func (h *ProviderHandler) Probe(c *gin.Context) {
+	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil {
+		respondError(c, http.StatusBadRequest, "invalid id")
+		return
+	}
+
+	type probeOverrideRequest struct {
+		APIKey  string                  `json:"apiKey"`
+		BaseURL string                  `json:"baseUrl"`
+		Models  []provider.CatalogModel `json:"models"`
+	}
+	var overrideReq probeOverrideRequest
+	// Body is optional; ignore bind errors when no body is sent.
+	_ = c.ShouldBindJSON(&overrideReq)
+
+	result, err := h.service.ProbeWithOverride(tenant.GetTenantID(c), id, overrideReq.APIKey, overrideReq.BaseURL, overrideReq.Models)
+	if err != nil {
+		respondProviderError(c, err)
+		return
+	}
+	respondSuccess(c, result)
+}
+
+type probeConfigRequest struct {
+	BaseURL   string                  `json:"baseUrl" binding:"required"`
+	APIKey    string                  `json:"apiKey"`
+	Protocol  string                  `json:"protocol"`
+	AuthStyle string                  `json:"authStyle"`
+	Models    []provider.CatalogModel `json:"models"`
+}
+
+func (h *ProviderHandler) ProbeConfig(c *gin.Context) {
+	var req probeConfigRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		respondError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	protocol := req.Protocol
+	if protocol == "" {
+		protocol = string(provider.ProtocolAnthropic)
+	}
+	authStyle := req.AuthStyle
+	if authStyle == "" {
+		authStyle = string(provider.AuthStyleAPIKey)
+	}
+
+	result := h.service.ProbeConfig(req.BaseURL, req.APIKey, protocol, authStyle, req.Models)
+	respondSuccess(c, result)
+}
+
+// ListRuntimeConfig serves every provider's runtime configuration (including
+// plaintext API keys) to any authenticated user, so Zerone Desktop can make
+// local model calls. The response is marked no-store.
+// 这是客户端例行读取（非管理类敏感操作），按审计范围定稿不落审计
+// （2026-09-14 用户确认移除；凭证敏感面由 provider.reveal_key（admin）覆盖）。
+func (h *ProviderHandler) ListRuntimeConfig(c *gin.Context) {
+	configs, err := h.service.ListRuntimeConfigs(tenant.GetTenantID(c))
+	if err != nil {
+		respondProviderError(c, err)
+		return
+	}
+
+	c.Header("Cache-Control", "no-store")
+	respondSuccess(c, configs)
+}
+
+// RevealAPIKey returns a provider's plaintext API key to an authorized admin.
+func (h *ProviderHandler) RevealAPIKey(c *gin.Context) {
+	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil {
+		respondError(c, http.StatusBadRequest, "invalid id")
+		return
+	}
+
+	apiKey, err := h.service.RevealAPIKey(tenant.GetTenantID(c), id)
+	if err != nil {
+		respondProviderError(c, err)
+		return
+	}
+
+	h.audit.RevealKeyLegacy(c, id)
+	respondSuccess(c, gin.H{"apiKey": apiKey})
+}
+
+// AttrRules returns the provider-specific attribute rules used to
+// dynamically render the provider form. When ?protocol= is given,
+// only that protocol's rules are returned; otherwise the full map.
+func (h *ProviderHandler) AttrRules(c *gin.Context) {
+	protocol := c.Query("protocol")
+	if protocol != "" {
+		rules := provider.ProviderAttrRules[protocol]
+		if rules == nil {
+			rules = []provider.AttrRule{}
+		}
+		respondSuccess(c, map[string][]provider.AttrRule{protocol: rules})
+		return
+	}
+	respondSuccess(c, provider.ProviderAttrRules)
+}
+
+// ── Per-model CRUD ──────────────────────────────────────────────
+
+type createModelRequest struct {
+	ModelID       string   `json:"modelId" binding:"required"`
+	DisplayName   string   `json:"displayName"`
+	ModelType     string   `json:"modelType" binding:"required"`
+	ContextWindow int      `json:"contextWindow"`
+	Efforts       []string `json:"efforts"`
+}
+
+// AddModel attaches a new model row to an existing provider and returns
+// the updated provider DTO so the frontend gets the new state in one
+// round-trip.
+func (h *ProviderHandler) AddModel(c *gin.Context) {
+	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil {
+		respondError(c, http.StatusBadRequest, "invalid id")
+		return
+	}
+	var req createModelRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		respondError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	dto, err := h.service.AddModel(tenant.GetTenantID(c), id, &services.AddModelInput{
+		ModelID:       req.ModelID,
+		DisplayName:   req.DisplayName,
+		ModelType:     req.ModelType,
+		ContextWindow: req.ContextWindow,
+		Efforts:       req.Efforts,
+	})
+	if err != nil {
+		respondProviderError(c, err)
+		return
+	}
+	respondCreated(c, dto)
+}
+
+type updateModelRequest struct {
+	DisplayName   *string   `json:"displayName"`
+	ModelType     *string   `json:"modelType"`
+	ContextWindow *int      `json:"contextWindow"`
+	Status        *string   `json:"status"`
+	Efforts       *[]string `json:"efforts"`
+}
+
+// UpdateModel applies a partial update to a single model row identified
+// by (providerID, selectionID) and returns the updated provider DTO.
+func (h *ProviderHandler) UpdateModel(c *gin.Context) {
+	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil {
+		respondError(c, http.StatusBadRequest, "invalid id")
+		return
+	}
+	selectionID := c.Param("selectionId")
+	var req updateModelRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		respondError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	dto, err := h.service.UpdateModel(tenant.GetTenantID(c), id, selectionID, &services.UpdateModelInput{
+		DisplayName:   req.DisplayName,
+		ModelType:     req.ModelType,
+		ContextWindow: req.ContextWindow,
+		Status:        req.Status,
+		Efforts:       req.Efforts,
+	})
+	if err != nil {
+		respondProviderError(c, err)
+		return
+	}
+	respondSuccess(c, dto)
+}
+
+// DeleteModel removes a single model row identified by (providerID,
+// selectionID).
+func (h *ProviderHandler) DeleteModel(c *gin.Context) {
+	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil {
+		respondError(c, http.StatusBadRequest, "invalid id")
+		return
+	}
+	selectionID := c.Param("selectionId")
+	if err := h.service.DeleteModel(tenant.GetTenantID(c), id, selectionID); err != nil {
+		respondProviderError(c, err)
+		return
+	}
+	respondMessage(c, http.StatusOK, "Model 已删除")
+}
+
+// ── MultiRAG sync ───────────────────────────────────────────────
+
+type syncToMultiRAGRequest struct {
+	VerifyOnly bool     `json:"verifyOnly"`
+	ModelIds   []string `json:"modelIds"`
+}
+
+// SyncToMultiRAG pushes a provider's configuration to the configured
+// MultiRAG instance. The MultiRAG client is constructed at server startup
+// from cfg.Knowledge.MultiragBaseURL / MultiragAPIKey and injected via
+// NewProviderHandler; when absent, the endpoint returns 503.
+//
+// Body (optional): {"verifyOnly": bool, "modelIds": ["a","b"]} — modelIds
+// restricts which models to sync; when empty, all models are synced.
+func (h *ProviderHandler) SyncToMultiRAG(c *gin.Context) {
+	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil {
+		respondError(c, http.StatusBadRequest, "invalid id")
+		return
+	}
+	var req syncToMultiRAGRequest
+	// Body is optional; ignore bind errors when no body is sent.
+	_ = c.ShouldBindJSON(&req)
+
+	result, err := h.service.SyncProviderToMultiRAG(c.Request.Context(), tenant.GetTenantID(c), id, h.multiragClient, req.VerifyOnly, req.ModelIds)
+	if err != nil {
+		respondProviderError(c, err)
+		return
+	}
+	h.audit.Simple(c, audit.ActionSyncMultirag, audit.TargetProvider, c.Param("id"), "")
+	respondSuccess(c, result)
+}

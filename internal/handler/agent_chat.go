@@ -1,0 +1,953 @@
+package handler
+
+import (
+	"bufio"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+
+	"control-panel/internal/application/services"
+	"control-panel/internal/auth/jwtutil"
+	"control-panel/internal/domain/chat"
+	rundomain "control-panel/internal/domain/run"
+	"control-panel/internal/domain/tenant"
+	"control-panel/internal/infrastructure/runtime"
+
+	"github.com/gin-gonic/gin"
+)
+
+type AgentChatHandler struct {
+	svc            *services.AgentChatService
+	runTrace       runTraceService
+	promptComposer promptDeliveryService
+	usage          *services.UsageService // H7.5 advisory usage hook; nil = off
+}
+
+type runTraceService interface {
+	Get(tenantID, id string) (*rundomain.Run, error)
+	AppendActivity(tenantID, runID string, input services.AppendRunActivityInput) (*rundomain.RunActivity, error)
+}
+
+type promptDeliveryService interface {
+	ComposeForDelivery(tenantID, runID string, agentID uint64, userInput string) (*rundomain.PromptSnapshot, string, error)
+	MarkDelivery(tenantID, snapshotID, status string) error
+}
+
+func NewAgentChatHandler(svc *services.AgentChatService, runTrace ...runTraceService) *AgentChatHandler {
+	h := &AgentChatHandler{svc: svc}
+	if len(runTrace) > 0 {
+		h.runTrace = runTrace[0]
+	}
+	return h
+}
+
+// SetPromptComposer enables run-scoped prompt delivery without changing the
+// legacy chat constructor used by integrations that do not support Runs.
+func (h *AgentChatHandler) SetPromptComposer(service promptDeliveryService) {
+	h.promptComposer = service
+}
+
+// SetUsageService 注入 H7.5 用量采集（advisory：Record 永不阻塞、永不
+// panic，聊天路径不因埋点失败而受影响）。
+func (h *AgentChatHandler) SetUsageService(u *services.UsageService) { h.usage = u }
+
+// recordModelCall 是聊天路径的 model_call 埋点（nil-safe + Record 自身
+// recover，调用处零心智负担）。
+func (h *AgentChatHandler) recordModelCall(tenantID, runID, messageID string, agentID uint64, fallbackModel, fallbackProvider string, result runtimeUsage, latency time.Duration, runErr string) {
+	if h.usage == nil {
+		return
+	}
+	latencyMs := latency.Milliseconds()
+	model := firstNonEmpty(result.Model, fallbackModel)
+	provider := firstNonEmpty(result.Provider, fallbackProvider)
+	dedupKey := tenantID + ":model_call:" + messageID
+	var agentIDPtr *uint64
+	if agentID != 0 {
+		agentIDPtr = &agentID
+	}
+	h.usage.Record(services.UsageRecordInput{
+		Kind: "model_call", TenantID: tenantID, RunID: runID, MessageID: messageID,
+		DedupKey: &dedupKey, AgentID: agentIDPtr, Provider: provider, Model: model,
+		TokensIn: result.TokensIn, TokensOut: result.TokensOut, TokensTotal: result.TokensTotal,
+		LatencyMs: &latencyMs, Error: runErr,
+	})
+}
+
+// blockGuestInvisibleAgent: guest 访问未开放 Agent 时写中性 404（与
+// agent 不存在同形，防枚举）并返回 true（调用方直接 return）。AgentGuestVisible
+// 对 not-found 返回 (false, nil)，因此 guest 访问真不存在的 agent 与未开放
+// 的 agent 得到逐字节相同的响应；infra 故障落 500 中性，绝不伪装 not-found。
+func (h *AgentChatHandler) blockGuestInvisibleAgent(c *gin.Context, agentName string) bool {
+	if !jwtutil.IsGuest(c) {
+		return false
+	}
+	visible, err := h.svc.AgentGuestVisible(tenant.GetTenantID(c), agentName)
+	if err != nil {
+		respondError(c, http.StatusInternalServerError, "internal error")
+		return true
+	}
+	if !visible {
+		respondError(c, http.StatusNotFound, "agent not found")
+		return true
+	}
+	return false
+}
+
+func (h *AgentChatHandler) ListSessions(c *gin.Context) {
+	agentName := services.NormalizeAgentName(c.Param("name"))
+	if h.blockGuestInvisibleAgent(c, agentName) {
+		return
+	}
+	userID := c.MustGet("user_id").(string)
+	source := c.Query("source")
+
+	page, pageSize := parsePagination(c, 1, 30)
+	sessions, total, err := h.svc.ListSessions(tenant.GetTenantID(c), userID, agentName, source, page, pageSize)
+	if err != nil {
+		respondError(c, http.StatusInternalServerError, err.Error())
+		return
+	}
+	respondSuccess(c, gin.H{
+		"items": sessions,
+		"total": total,
+	})
+}
+
+type createSessionReq struct {
+	Title string `json:"title"`
+}
+
+func (h *AgentChatHandler) CreateSession(c *gin.Context) {
+	agentName := services.NormalizeAgentName(c.Param("name"))
+	if h.blockGuestInvisibleAgent(c, agentName) {
+		return
+	}
+	userID := c.MustGet("user_id").(string)
+	userName, _ := c.Get("user_name")
+	displayName, _ := c.Get("display_name")
+
+	var req createSessionReq
+	_ = c.ShouldBindJSON(&req)
+
+	sess, err := h.svc.CreateSession(
+		tenant.GetTenantID(c),
+		userID,
+		agentName,
+		req.Title,
+		stringOrEmpty(userName),
+		stringOrEmpty(displayName),
+	)
+	if err != nil {
+		respondError(c, http.StatusInternalServerError, err.Error())
+		return
+	}
+	respondSuccess(c, sess)
+}
+
+func (h *AgentChatHandler) ListMessages(c *gin.Context) {
+	agentName := services.NormalizeAgentName(c.Param("name"))
+	if h.blockGuestInvisibleAgent(c, agentName) {
+		return
+	}
+	sessionID := c.Param("id")
+	userID := c.MustGet("user_id").(string)
+
+	page, pageSize := parsePagination(c, 1, 50)
+	msgs, total, err := h.svc.GetMessages(tenant.GetTenantID(c), userID, agentName, sessionID, page, pageSize)
+	if err != nil {
+		respondError(c, http.StatusNotFound, err.Error())
+		return
+	}
+	respondSuccess(c, gin.H{
+		"items": msgs,
+		"total": total,
+	})
+}
+
+func (h *AgentChatHandler) DeleteSession(c *gin.Context) {
+	agentName := services.NormalizeAgentName(c.Param("name"))
+	if h.blockGuestInvisibleAgent(c, agentName) {
+		return
+	}
+	sessionID := c.Param("id")
+	userID := c.MustGet("user_id").(string)
+
+	if err := h.svc.DeleteSession(tenant.GetTenantID(c), userID, agentName, sessionID); err != nil {
+		respondError(c, http.StatusNotFound, err.Error())
+		return
+	}
+	respondMessage(c, http.StatusOK, "session deleted")
+}
+
+// Capabilities reports feature availability for the agent chat page
+// (issue #94: attachments require the runtime to declare
+// attachmentExpectedGeneration, runtime >= 2.7.0).
+func (h *AgentChatHandler) Capabilities(c *gin.Context) {
+	agentName := services.NormalizeAgentName(c.Param("name"))
+	if h.blockGuestInvisibleAgent(c, agentName) {
+		return
+	}
+	ok := h.svc.AttachmentsAvailable(c.Request.Context(), tenant.GetTenantID(c), agentName)
+	respondSuccess(c, gin.H{"attachmentsEnabled": ok})
+}
+
+type sendMessageReq struct {
+	Content     string                    `json:"content"`
+	Attachments []services.AttachmentDesc `json:"attachments"`
+	RunID       string                    `json:"runId,omitempty"`
+}
+
+// runRequestBody is the POST /v1/agents/{agentId}/runs JSON body. attachments
+// are relayed verbatim (runtime re-validates name/size/path).
+type runRequestBody struct {
+	Message     string                    `json:"message"`
+	SessionID   string                    `json:"sessionId,omitempty"`
+	Attachments []services.AttachmentDesc `json:"attachments,omitempty"`
+}
+
+// SendMessage is the SSE streaming endpoint.
+func (h *AgentChatHandler) SendMessage(c *gin.Context) {
+	agentName := services.NormalizeAgentName(c.Param("name"))
+	if h.blockGuestInvisibleAgent(c, agentName) {
+		return
+	}
+	sessionID := c.Param("id")
+	userID := c.MustGet("user_id").(string)
+	tenantID := tenant.GetTenantID(c)
+
+	var req sendMessageReq
+	// 严格解码（issue #94 review F4）：未知字段（如伪造的 base64 内联数据）
+	// 一律 400，不静默丢弃——客户端契约错误尽早暴露。
+	dec := json.NewDecoder(c.Request.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		respondErrorCode(c, http.StatusBadRequest, chat.ErrCodeInvalidAttachment, "请求包含无法识别的字段")
+		return
+	}
+	// 尾随值（issue #94 review R2 F2）：首个 JSON 值之后必须直接 EOF——
+	// `{"content":"hi"}{"base64":...}` 这类拼接 body 一律 400，不静默取首值。
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); err != io.EOF {
+		respondErrorCode(c, http.StatusBadRequest, chat.ErrCodeInvalidAttachment, "请求格式错误")
+		return
+	}
+	if strings.TrimSpace(req.Content) == "" && len(req.Attachments) == 0 {
+		respondErrorCode(c, http.StatusBadRequest, chat.ErrCodeInvalidAttachment, "请输入文本或添加附件")
+		return
+	}
+	if err := services.ValidateAttachmentDescs(req.Attachments); err != nil {
+		log.Printf("[chat] rejected attachment descriptors: session=%s err=%v", sessionID, err)
+		respondErrorCode(c, http.StatusBadRequest, chat.ErrCodeInvalidAttachment, "附件信息无效")
+		return
+	}
+
+	// 1. Load session FIRST and verify the agent binding before persisting
+	// anything (issue #94: session.AgentID must match :name — a mismatch
+	// 404s without leaking existence).
+	sess, err := h.svc.GetSession(tenantID, userID, sessionID)
+	if err != nil {
+		log.Printf("[chat] send message session lookup failed: tenant=%s session=%s user=%s err=%v",
+			tenantID, sessionID, userID, err)
+		respondError(c, http.StatusNotFound, "会话不存在")
+		return
+	}
+	if sess.AgentID != agentName {
+		respondError(c, http.StatusNotFound, "会话不存在")
+		return
+	}
+	// A chat execution may be attached to an explicit H1 Run. Legacy chat
+	// remains valid without runId; once supplied, the Run must be running and
+	// contain this Agent in its immutable participant snapshot.
+	var runParticipant *rundomain.RunAgent
+	if req.RunID != "" {
+		runParticipant, err = h.validateRunParticipant(tenantID, req.RunID, agentName)
+		if err != nil {
+			respondError(c, http.StatusConflict, err.Error())
+			return
+		}
+	}
+	usageAgentID, usageModel, usageProvider, identityErr := h.svc.AgentUsageIdentity(tenantID, agentName)
+	if identityErr != nil {
+		log.Printf("[usage] resolve agent attribution failed: tenant=%s agent=%s err=%v", tenantID, agentName, identityErr)
+	}
+	if runParticipant != nil {
+		usageAgentID = runParticipant.AgentID
+	}
+	// 2. Resolve runtime URL, API key, and the deployer-reported container id
+	// BEFORE anything is persisted: the attachment probe below needs the base
+	// URL, and a resolve failure must not leave a persisted user turn (or an
+	// orphan system error message) behind — the client keeps its input and
+	// can simply retry.
+	baseURL, apiKey, containerID, err := h.svc.ResolveRuntime(tenantID, agentName)
+	if err != nil {
+		// HTTP 响应只给中性中文文案，英文细节进日志（CONTRIBUTING Standards 1）。
+		log.Printf("[chat] resolve runtime failed: tenant=%s agent=%s session=%s err=%v",
+			tenantID, agentName, sessionID, err)
+		respondError(c, http.StatusConflict, "Agent 暂不可用，请稍后重试")
+		return
+	}
+
+	// 空 containerID fail-closed（issue #94 review R4 P1-2）：deployer 未报告
+	// 容器代次 ⇒ 代次授权锚点缺失。若放行到记录校验，「历史空代记录 + 当前
+	// 空 ID」会判相等通过（fail-open）——入口统一拒绝；纯文本消息不受影响。
+	if len(req.Attachments) > 0 && containerID == "" {
+		log.Printf("[chat] send rejected, empty container generation: tenant=%s agent=%s session=%s",
+			tenantID, agentName, sessionID)
+		respondError(c, http.StatusServiceUnavailable, "部署状态异常，附件暂不可用，请稍后重试")
+		return
+	}
+
+	// 3. 附件能力门控（issue #94 review F3）：/health 能力探测（runtime
+	// v2.7.0+ 以 capabilities.attachmentExpectedGeneration 声明；旧版本无该
+	// 字段恒 false，版本号不再参与判定）。未声明能力的 runtime 对 run 请求的
+	// attachments 字段可能静默忽略、且缺少代次原子校验——宁可拒绝也不静默
+	// 丢附件。探测先于持久化：拒绝时还没有任何已落库内容需要回滚。纯文本
+	// 消息跳过探测。
+	if len(req.Attachments) > 0 {
+		if !h.svc.AttachmentsSupportedAt(c.Request.Context(), baseURL) {
+			respondErrorCode(c, http.StatusNotImplemented, chat.ErrCodeRuntimeAttachmentUnsupported,
+				"当前 Runtime 版本不支持附件（需升级到支持代次校验的版本，≥ 2.7.0）")
+			return
+		}
+	}
+
+	// 4. Upload-record binding (issue #94 review F1 + R3)：每个描述符必须
+	// 与服务端在上传时落库的记录全等，且记录必须属于当前容器代次——
+	// deployer 报告的不可变 container id 精确相等（零时间容差）。重部署
+	// 清空 `.zerone-uploads` 后，同名文件的新上传会拿到与旧容器完全相同的
+	// 路径，旧代记录不能再授权（否则读到的是新上传者的字节）。`.zerone-uploads`
+	// 是同 Agent runtime 容器内所有用户共享的目录——仅做语法校验就落库的
+	// 话，伪造描述符即可把他人 path 写进自己会话再经内容代理下载。
+	// rec.ContainerID == "" 恒拒（review R4 P1-2）：升级前落库的历史空代
+	// 记录一律无效——空对空判相等的放行口子从记录侧也封死。
+	for _, a := range req.Attachments {
+		rec, err := h.svc.GetUploadRecord(tenantID, userID, sessionID, a.ID)
+		if err != nil || rec.Name != a.Name || rec.Mime != a.Mime || rec.Size != a.Size || rec.Path != a.Path ||
+			rec.ContainerID == "" || rec.ContainerID != containerID {
+			respondErrorCode(c, http.StatusBadRequest, chat.ErrCodeInvalidAttachment,
+				"附件信息无效或已失效，请重新上传")
+			return
+		}
+	}
+
+	// For an explicit Run, the runtime receives a JSON envelope containing the
+	// platform-owned composed context and the exact user input. JSON encoding
+	// makes user text data rather than a forgeable prompt delimiter. The chat
+	// message persisted below intentionally remains the original user input.
+	runtimeMessage := req.Content
+	var promptSnapshot *rundomain.PromptSnapshot
+	if req.RunID != "" {
+		if h.promptComposer == nil {
+			respondError(c, http.StatusServiceUnavailable, "运行上下文服务暂不可用")
+			return
+		}
+		promptSnapshot, runtimeMessage, err = h.promptComposer.ComposeForDelivery(tenantID, req.RunID, runParticipant.AgentID, req.Content)
+		if err != nil {
+			log.Printf("[chat] compose run prompt failed: tenant=%s run=%s agent=%s err=%v", tenantID, req.RunID, agentName, err)
+			respondError(c, http.StatusConflict, "本次运行的判断背景生成失败")
+			return
+		}
+	}
+	msg, err := h.svc.SaveUserMessage(tenantID, userID, sessionID, req.Content, req.Attachments)
+	if err != nil {
+		if promptSnapshot != nil {
+			_ = h.promptComposer.MarkDelivery(tenantID, promptSnapshot.ID, "failed")
+		}
+		log.Printf("[chat] save user message failed: tenant=%s session=%s user=%s err=%v",
+			tenantID, sessionID, userID, err)
+		respondError(c, http.StatusNotFound, "会话不存在")
+		return
+	}
+	executionID := msg.ID
+	if req.RunID != "" {
+		h.appendRunActivity(tenantID, req.RunID, services.AppendRunActivityInput{
+			Kind: "participant", Status: "active", ActorType: "agent", ActorID: agentName,
+			StepID: executionID, Name: agentName,
+		})
+		h.appendRunActivity(tenantID, req.RunID, services.AppendRunActivityInput{
+			Kind: "started", Status: "running", ActorType: "agent", ActorID: agentName,
+			StepID: executionID, Name: "agent_execution",
+			Input: map[string]any{"sessionId": sessionID, "messageId": msg.ID, "hasAttachments": len(req.Attachments) > 0},
+		})
+	}
+
+	// 5. Build runtime request body. Re-use the runtime SDK session id if this
+	// control-panel session has already been bound to one.
+	body := runRequestBody{Message: runtimeMessage}
+	if sess.RuntimeSessionID != "" {
+		body.SessionID = sess.RuntimeSessionID
+	}
+	if len(req.Attachments) > 0 {
+		body.Attachments = req.Attachments
+	}
+	bodyBytes, _ := json.Marshal(body)
+
+	// 6. Open runtime stream
+	ctx := c.Request.Context()
+	runStart := time.Now()
+	// runtime 注册名为裸 Agent ID（issue #114）；scoped deployment key 仅是
+	// deployer 资源标识，不参与 runtime 寻址。
+	// 带附件的 run 携带 X-Expected-Container-Id（runtime v2.7.0 原子代次校验
+	// 契约，issue #94 / runtime #61）：runtime 在任何文件读取/写入之前核验
+	// 自身容器身份，代次已变更则 412 拒绝——TOCTOU 窗口结构性封闭。纯文本
+	// 消息不带 header（无代次可断言，向后兼容）。
+	expectedContainerID := ""
+	if len(req.Attachments) > 0 {
+		expectedContainerID = containerID
+	}
+	rc, err := h.svc.RuntimeClient().StreamRun(ctx, baseURL, services.NormalizeAgentName(agentName), apiKey, bodyBytes, expectedContainerID)
+	if err != nil {
+		if promptSnapshot != nil {
+			_ = h.promptComposer.MarkDelivery(tenantID, promptSnapshot.ID, "failed")
+		}
+		if req.RunID != "" {
+			h.appendRunActivity(tenantID, req.RunID, services.AppendRunActivityInput{
+				Kind: "failed", Status: "failed", ActorType: "agent", ActorID: agentName,
+				StepID: executionID, Name: "agent_execution", Error: "runtime request failed",
+			})
+		}
+		// Runtime run-attachment domain errors (attachment_missing etc.) are
+		// pre-run failures: surface the code so the frontend can retry from
+		// local files instead of persisting a system error message. The code
+		// is parsed at the client boundary against an allowlist; the raw body
+		// never reaches the hub (main #121 credential-leak constraint).
+		var httpErr *runtime.RuntimeHTTPError
+		// 状态码与域码按契约逐对核验（review round 8）：错配的组合（如
+		// 503 + generation_mismatch）意味着不可信上游（网关/异常 runtime）
+		// 伪造的域码——不得驱动回滚、重传等客户端恢复动作，落入下方
+		// transport 兜底（中性 502，消息留存不回滚）。
+		if errors.As(err, &httpErr) && httpErr.AttachmentCode != "" &&
+			runtimeAttachmentContractMet(httpErr.StatusCode, httpErr.AttachmentCode) {
+			code := httpErr.AttachmentCode
+			// 白名单五码统一回滚（review F3：所有已识别的附件 pre-run 拒绝
+			// 都回滚）：runtime 在消费任何附件之前就拒绝，该 user turn 从未
+			// 生效——回滚乐观持久化的消息，重发（重新上传→再发）才不会在
+			// 历史里留下重复的 user turn。generation_unavailable（503 瞬时
+			// 部署异常）同样回滚：入口状态异常时保留一个「已发出」的假象
+			// 只会让用户对着注定失败的历史重试。删除失败仅日志——消息重复
+			// 是体验问题，不该阻塞错误上报。
+			if delErr := h.svc.DeleteMessageByID(tenantID, userID, sessionID, msg.ID); delErr != nil {
+				log.Printf("[chat] rollback user message failed: tenant=%s session=%s msg=%s err=%v",
+					tenantID, sessionID, msg.ID, delErr)
+			}
+			// 契约（runtime v2.7.0）：412 generation_mismatch 后禁止无 header
+			// 降级重试——去掉 X-Expected-Container-Id 重发会把代次不匹配
+			// 静默退化为旧的 TOCTOU 已知边界。此分支只 respond，不重试。
+			// 响应体已在 client 边界丢弃（main #121），日志只留 code+status。
+			log.Printf("[chat] runtime rejected run (pre-run failure): tenant=%s session=%s code=%s status=%d",
+				tenantID, sessionID, code, httpErr.StatusCode)
+			respondErrorCode(c, attachmentHTTPStatus(code), code, attachmentCodeMessage(code))
+			return
+		}
+		h.saveErrorMessage(tenantID, userID, sessionID, "Runtime 连接失败："+err.Error())
+		log.Printf("[chat] runtime stream failed: tenant=%s session=%s err=%v", tenantID, sessionID, err)
+		h.recordModelCall(tenantID, req.RunID, msg.ID, usageAgentID, usageModel, usageProvider, runtimeUsage{}, time.Since(runStart), "runtime_connect_failed")
+		respondError(c, http.StatusBadGateway, "Runtime 连接失败，请稍后重试")
+		return
+	}
+	defer rc.Close()
+	if promptSnapshot != nil {
+		if markErr := h.promptComposer.MarkDelivery(tenantID, promptSnapshot.ID, "delivered"); markErr != nil {
+			log.Printf("[chat] mark prompt delivered failed: tenant=%s run=%s snapshot=%s err=%v", tenantID, req.RunID, promptSnapshot.ID, markErr)
+		}
+	}
+
+	// 会话标题：优先文本；纯附件消息取第一个文件名（issue #94）。时机在
+	// runtime 流成功建立之后（review round 7）：pre-run 拒绝（回滚分支）与
+	// transport 失败都不该铸出「历史中从未存在」的标题——标题只属于真正
+	// 到达 runtime 的 user turn。
+	titleSeed := req.Content
+	if titleSeed == "" && len(req.Attachments) > 0 {
+		titleSeed = req.Attachments[0].Name
+	}
+	_ = h.svc.AutoTitleSession(tenantID, sessionID, titleSeed)
+
+	// 7. SSE headers + flusher
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		respondError(c, http.StatusInternalServerError, "streaming unsupported")
+		return
+	}
+
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+	c.Writer.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	// 8. Pipe byte-for-byte, buffer for aggregation. A heartbeat goroutine
+	// emits SSE comments (": ping\n\n") every 15s to keep intermediate proxies
+	// (nginx/Kong/Cloudflare) from killing the connection during long tool
+	// executions, where the runtime stream is otherwise silent for minutes.
+	// The writer is shared between the pump loop and the heartbeat goroutine,
+	// so both are serialized through writeMu.
+	var writeMu sync.Mutex
+	heartStop := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-heartStop:
+				return
+			case <-ticker.C:
+				writeMu.Lock()
+				_, _ = c.Writer.Write([]byte(": ping\n\n"))
+				flusher.Flush()
+				writeMu.Unlock()
+			}
+		}
+	}()
+
+	var aggregate strings.Builder
+	scanner := bufio.NewScanner(rc)
+	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		writeMu.Lock()
+		_, _ = c.Writer.Write(line)
+		_, _ = c.Writer.Write([]byte("\n"))
+		flusher.Flush()
+		writeMu.Unlock()
+
+		aggregate.Write(line)
+		aggregate.WriteByte('\n')
+	}
+	close(heartStop)
+
+	// 7. Persist whatever we captured — even if the client disconnected.
+	// Previously this branch short-circuited on ctx.Err(), so a proxy timeout
+	// during a long tool call erased the entire assistant turn and a refresh
+	// showed nothing. Now we always flush buffered content to the DB; the
+	// runtime keeps executing regardless of the downstream connection.
+	aggregateStr := aggregate.String()
+	if req.RunID != "" {
+		for _, activity := range extractRuntimeActivities(aggregateStr) {
+			input := decodeActivityObject(activity.InputJSON)
+			output := decodeActivityObject(activity.OutputJSON)
+			h.appendRunActivity(tenantID, req.RunID, services.AppendRunActivityInput{
+				Kind: activity.Kind, Status: activity.Status, ActorType: "agent", ActorID: agentName,
+				StepID: firstNonEmpty(activity.StepID, executionID), Name: activity.Name,
+				Input: input, Output: output, Error: activity.Error,
+			})
+		}
+		if scanErr := scanner.Err(); scanErr != nil {
+			h.appendRunActivity(tenantID, req.RunID, services.AppendRunActivityInput{
+				Kind: "failed", Status: "failed", ActorType: "agent", ActorID: agentName,
+				StepID: executionID, Name: "agent_execution", Error: "runtime stream interrupted",
+			})
+		}
+	}
+
+	// result/subtype=error（如 429 配额耗尽）是正常结束的流里携带的运行时
+	// 失败，scanner.Err 为 nil 覆盖不到；落库为系统错误消息，刷新后历史可见。
+	// 与流中断分支互斥，避免同一次失败双重落库。
+	if runErr := extractRuntimeError(aggregateStr); runErr != "" {
+		h.saveErrorMessage(tenantID, userID, sessionID, runErr)
+	} else if scanErr := scanner.Err(); scanErr != nil {
+		// scanner.Err() != nil means the runtime stream was truncated (network
+		// error, runtime crash, ctx cancellation, etc.). Surface it to the user so
+		// a refresh shows that the turn was interrupted.
+		h.saveErrorMessage(tenantID, userID, sessionID, "Runtime 流中断："+scanErr.Error())
+	}
+
+	// 8. Bind the runtime SDK session id returned on the first run. The runtime
+	// emits it in a system.init event; subsequent messages must include it to
+	// preserve context.
+	if sess.RuntimeSessionID == "" {
+		if runtimeSID := extractRuntimeSessionID(aggregateStr); runtimeSID != "" {
+			_ = h.svc.BindRuntimeSessionID(tenantID, sessionID, runtimeSID)
+		}
+	}
+
+	contentJSON := aggregateSSEToContent(aggregateStr)
+	if contentJSON != "" {
+		aigcLabel := extractAigcLabel(aggregateStr)
+		_, _ = h.svc.SaveAssistantMessage(tenantID, userID, sessionID, contentJSON, aigcLabel)
+	}
+	// H7.5 埋点：model_call（错误取自流内 result error / 流中断）。
+	usageErr := extractRuntimeError(aggregateStr)
+	if usageErr == "" {
+		if scanErr := scanner.Err(); scanErr != nil {
+			usageErr = "runtime_stream_interrupted"
+		}
+	}
+	h.recordModelCall(tenantID, req.RunID, msg.ID, usageAgentID, usageModel, usageProvider, extractRuntimeUsage(aggregateStr), time.Since(runStart), usageErr)
+}
+
+func (h *AgentChatHandler) validateRunParticipant(tenantID, runID, agentName string) (*rundomain.RunAgent, error) {
+	if h.runTrace == nil {
+		return nil, fmt.Errorf("运行跟踪服务暂不可用")
+	}
+	run, err := h.runTrace.Get(tenantID, runID)
+	if err != nil {
+		return nil, fmt.Errorf("运行不存在或不可访问")
+	}
+	if run.Status != rundomain.StatusRunning {
+		return nil, fmt.Errorf("运行当前不是执行中状态")
+	}
+	for i := range run.Agents {
+		participant := &run.Agents[i]
+		if services.NormalizeAgentName(participant.AgentNameSnapshot) == agentName {
+			return participant, nil
+		}
+	}
+	return nil, fmt.Errorf("当前 Agent 不在该运行的参与者中")
+}
+
+func (h *AgentChatHandler) appendRunActivity(tenantID, runID string, input services.AppendRunActivityInput) {
+	if h.runTrace == nil {
+		return
+	}
+	if _, err := h.runTrace.AppendActivity(tenantID, runID, input); err != nil {
+		log.Printf("[chat] append run activity failed: tenant=%s run=%s kind=%s err=%v", tenantID, runID, input.Kind, err)
+	}
+}
+
+func decodeActivityObject(raw string) map[string]any {
+	if raw == "" {
+		return nil
+	}
+	var object map[string]any
+	if json.Unmarshal([]byte(raw), &object) == nil {
+		return object
+	}
+	var value any
+	if json.Unmarshal([]byte(raw), &value) == nil {
+		return map[string]any{"value": value}
+	}
+	return map[string]any{"value": raw}
+}
+
+func firstNonEmpty(value, fallback string) string {
+	if value != "" {
+		return value
+	}
+	return fallback
+}
+
+// saveErrorMessage persists a system error message so the failure is visible
+// in the chat history after a refresh.
+func (h *AgentChatHandler) saveErrorMessage(tenantID, userID, sessionID, message string) {
+	payload, _ := json.Marshal([]map[string]string{{"type": "error", "message": message}})
+	_, _ = h.svc.SaveSystemMessage(tenantID, userID, sessionID, string(payload))
+}
+
+// extractRuntimeError scans the buffered SSE stream for a result event with
+// subtype=error (e.g. 429 quota exhausted, surfaced after runtime-internal
+// retries give up) and returns the joined error messages, falling back to
+// error_type when the errors array is empty. Returns "" when the run did not
+// fail. Malformed lines are skipped.
+func extractRuntimeError(sse string) string {
+	lines := strings.Split(sse, "\n")
+	var eventName string
+	var messages []string
+	var errorType string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			eventName = ""
+			continue
+		}
+		if strings.HasPrefix(line, "event:") {
+			eventName = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+			continue
+		}
+		if eventName != "result" || !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		var data struct {
+			Type      string   `json:"type"`
+			Subtype   string   `json:"subtype"`
+			ErrorType string   `json:"error_type"`
+			Errors    []string `json:"errors"`
+		}
+		if err := json.Unmarshal([]byte(payload), &data); err != nil {
+			continue
+		}
+		if data.Type == "result" && data.Subtype == "error" {
+			messages = append(messages, data.Errors...)
+			if errorType == "" {
+				errorType = data.ErrorType
+			}
+		}
+	}
+	if len(messages) > 0 {
+		return strings.Join(messages, "\n")
+	}
+	return errorType
+}
+
+// runtimeUsage is the normalized terminal usage envelope emitted by the
+// runtime. Pointers preserve the distinction between an explicit zero (for a
+// rejected call) and an older runtime that did not report usage at all.
+type runtimeUsage struct {
+	Model       string
+	Provider    string
+	TokensIn    *int64
+	TokensOut   *int64
+	TokensTotal *int64
+}
+
+// extractRuntimeUsage reads the last valid result event. Runtime versions use
+// both Anthropic-style input_tokens/output_tokens and OpenAI-style
+// prompt_tokens/completion_tokens, so accept both without guessing zero for a
+// missing field. The terminal result is authoritative over earlier events.
+func extractRuntimeUsage(sse string) runtimeUsage {
+	var found runtimeUsage
+	lines := strings.Split(sse, "\n")
+	var eventName string
+	for _, rawLine := range lines {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			eventName = ""
+			continue
+		}
+		if strings.HasPrefix(line, "event:") {
+			eventName = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+			continue
+		}
+		if eventName != "result" || !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		var data struct {
+			Type     string `json:"type"`
+			Model    string `json:"model"`
+			Provider string `json:"provider"`
+			Usage    struct {
+				InputTokens      *int64 `json:"input_tokens"`
+				OutputTokens     *int64 `json:"output_tokens"`
+				PromptTokens     *int64 `json:"prompt_tokens"`
+				CompletionTokens *int64 `json:"completion_tokens"`
+				TotalTokens      *int64 `json:"total_tokens"`
+			} `json:"usage"`
+		}
+		if json.Unmarshal([]byte(payload), &data) != nil || data.Type != "result" {
+			continue
+		}
+		in := data.Usage.InputTokens
+		if in == nil {
+			in = data.Usage.PromptTokens
+		}
+		out := data.Usage.OutputTokens
+		if out == nil {
+			out = data.Usage.CompletionTokens
+		}
+		total := data.Usage.TotalTokens
+		if total == nil && (in != nil || out != nil) {
+			value := int64(0)
+			if in != nil {
+				value += *in
+			}
+			if out != nil {
+				value += *out
+			}
+			total = &value
+		}
+		found = runtimeUsage{Model: data.Model, Provider: data.Provider, TokensIn: in, TokensOut: out, TokensTotal: total}
+	}
+	return found
+}
+
+// extractRuntimeSessionID scans the raw SSE stream for the first system.init
+// event and returns its session_id field.
+func extractRuntimeSessionID(sse string) string {
+	lines := strings.Split(sse, "\n")
+	var eventName string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			eventName = ""
+			continue
+		}
+		if strings.HasPrefix(line, "event:") {
+			eventName = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+			continue
+		}
+		if eventName != "system" || !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		var data struct {
+			Type      string `json:"type"`
+			Subtype   string `json:"subtype"`
+			SessionID string `json:"session_id"`
+		}
+		if err := json.Unmarshal([]byte(payload), &data); err != nil {
+			continue
+		}
+		if data.Type == "system" && data.Subtype == "init" && data.SessionID != "" {
+			return data.SessionID
+		}
+	}
+	return ""
+}
+
+// aggregateSSEToContent parses buffered SSE stream into a content JSON array.
+func aggregateSSEToContent(sse string) string {
+	type segment struct {
+		Type      string            `json:"type"`
+		Text      string            `json:"text,omitempty"`
+		Reasoning string            `json:"reasoning,omitempty"`
+		Name      string            `json:"name,omitempty"`
+		ID        string            `json:"id,omitempty"`
+		Input     map[string]string `json:"input,omitempty"`
+		Content   interface{}       `json:"content,omitempty"`
+		ToolUseID string            `json:"toolUseId,omitempty"`
+		IsError   bool              `json:"isError,omitempty"`
+	}
+
+	// SDK SSE 协议（2026-07-06 验证）：
+	//   partial_message × N → assistant × 1 → [tool_result → partial_message × M → assistant × 1]...
+	// 后端持久化只需 assistant（turn 完整 message）和 tool_result，忽略 partial_message
+	// （流式增量不需要持久化，assistant 已包含完整内容）。按事件顺序追加到单个 slice。
+	var segments []segment
+
+	lines := strings.Split(sse, "\n")
+	var eventName string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			eventName = ""
+			continue
+		}
+		if strings.HasPrefix(line, "event:") {
+			eventName = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+			continue
+		}
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "" || payload == "{}" {
+			continue
+		}
+
+		var generic map[string]interface{}
+		if err := json.Unmarshal([]byte(payload), &generic); err != nil {
+			continue
+		}
+
+		switch eventName {
+		case "assistant":
+			// turn 完成的完整 message，按事件顺序直接追加
+			msg, _ := generic["message"].(map[string]interface{})
+			if msg == nil {
+				continue
+			}
+			contentArr, _ := msg["content"].([]interface{})
+			for _, item := range contentArr {
+				block, _ := item.(map[string]interface{})
+				if block == nil {
+					continue
+				}
+				blockType, _ := block["type"].(string)
+				switch blockType {
+				case "text":
+					if text, _ := block["text"].(string); text != "" {
+						segments = append(segments, segment{Type: "text", Text: text})
+					}
+				case "thinking":
+					if thinking, _ := block["thinking"].(string); thinking != "" {
+						segments = append(segments, segment{Type: "reasoning", Reasoning: thinking})
+					}
+				case "tool_use":
+					name, _ := block["name"].(string)
+					id, _ := block["id"].(string)
+					input, _ := block["input"].(map[string]interface{})
+					strInput := make(map[string]string, len(input))
+					for k, v := range input {
+						strInput[k] = fmt.Sprintf("%v", v)
+					}
+					segments = append(segments, segment{Type: "tool_use", Name: name, ID: id, Input: strInput})
+				}
+			}
+		case "tool_result":
+			// SDK 协议：result 是嵌套对象 {tool_use_id, tool_name, output}
+			resultObj, _ := generic["result"].(map[string]interface{})
+			var content interface{}
+			var toolUseID string
+			if resultObj != nil {
+				content = resultObj["output"]
+				if id, ok := resultObj["tool_use_id"].(string); ok {
+					toolUseID = id
+				}
+			}
+			segments = append(segments, segment{
+				Type:      "tool_result",
+				Content:   content,
+				ToolUseID: toolUseID,
+				// SDK 当前不在 SSE 事件里暴露 is_error，固定 false
+			})
+		}
+	}
+
+	if len(segments) == 0 {
+		return ""
+	}
+	b, err := json.Marshal(segments)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+// extractAigcLabel scans the raw SSE stream for the GB 45438-2025 label the
+// runtime injects into both the system init event and the result event
+// (dual anchors for truncated streams). The result event is authoritative;
+// the first system-event value is the fallback. Returns the raw aigc JSON
+// object, or "" when no label was present. Malformed lines are skipped.
+func extractAigcLabel(sse string) string {
+	lines := strings.Split(sse, "\n")
+	var eventName string
+	var fallback, authoritative string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			eventName = ""
+			continue
+		}
+		if strings.HasPrefix(line, "event:") {
+			eventName = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+			continue
+		}
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		if eventName != "system" && eventName != "result" {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		var data struct {
+			Aigc json.RawMessage `json:"aigc"`
+		}
+		if err := json.Unmarshal([]byte(payload), &data); err != nil {
+			continue
+		}
+		if len(data.Aigc) == 0 || string(data.Aigc) == "null" {
+			continue
+		}
+		switch eventName {
+		case "result":
+			authoritative = string(data.Aigc)
+		case "system":
+			if fallback == "" {
+				fallback = string(data.Aigc)
+			}
+		}
+	}
+	if authoritative != "" {
+		return authoritative
+	}
+	return fallback
+}

@@ -1,0 +1,206 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+env:
+  GOPROXY: "https://mirrors.aliyun.com/goproxy/,https://goproxy.huaweicloud.com,direct"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Check gofmt
+        run: |
+          output=$(gofmt -l .)
+          if [ -n "$output" ]; then
+            echo "以下文件未通过 gofmt 格式检查:"
+            echo "$output"
+            exit 1
+          fi
+
+  test:
+    runs-on: ubuntu-latest
+    # MySQL 8 service：供 pkg/database 的 migration 冒烟/升级测试
+    # （TEST_MYSQL_DSN 门控，MYSQL_DATABASE=hub 自动建基础库；测试各自
+    # DROP/CREATE 专用冒烟库，互不干扰）
+    services:
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: test
+          MYSQL_DATABASE: hub
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -ptest"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+    env:
+      TEST_MYSQL_DSN: root:test@tcp(127.0.0.1:3306)/hub?parseTime=true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Install platform-neutrality scanner
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+
+      - name: Verify platform boundary without Speeding
+        env:
+          H0_DATABASE_URL: root:test@tcp(127.0.0.1:3306)/hub?charset=utf8mb4&parseTime=true
+        run: ./scripts/verify-core-without-speeding.sh
+
+      - name: Run tests
+        run: go test -v ./...
+
+  frontend-test:
+    runs-on: ubuntu-latest
+    # PR 时跑 subset（排除 4 个慢文件），main push 时由 frontend-test-full 替代
+    if: github.event_name == 'pull_request'
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check and run tests (parallel, PR subset)
+        run: |
+          npx tsc --noEmit &
+          TSC_PID=$!
+          # PR 排除最慢的 4 个组件测试文件（共 ~27s），缩短反馈循环
+          # 这些测试在 frontend-test-full (main push 后) 中完整运行
+          npx vitest run \
+            --exclude '**/SkillMdPreview.test.tsx' \
+            --exclude '**/KnowledgeForm.test.tsx' \
+            --exclude '**/KnowledgeChunksPage.test.tsx' \
+            --exclude '**/KnowledgeDocumentsPage.test.tsx'
+          TEST_EXIT=$?
+          wait $TSC_PID
+          TSC_EXIT=$?
+          if [ $TEST_EXIT -ne 0 ] || [ $TSC_EXIT -ne 0 ]; then
+            exit 1
+          fi
+
+  # frontend-lint is the strict ESLint pass. Now that all pre-existing
+  # violations have been resolved (0 errors, 27 warnings), this job is
+  # blocking: any new lint error will fail the CI run.
+  frontend-lint:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        run: npx eslint .
+
+  # h5 移动端 SPA 门禁：type check + 生产构建（与 Dockerfile h5-builder
+  # 同路径，vite build base=/static/h5/）。h5 无 eslint 配置与测试，
+  # lint 脚本即 tsc --noEmit。
+  h5-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: h5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: h5/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check and build
+        run: |
+          npx tsc --noEmit
+          npx vite build
+
+  # Full test suite (including slow component tests excluded from PR runs).
+  # Replaces frontend-test on main push. PR 触发时此 job skip。
+  frontend-test-full:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check and run full test suite
+        run: |
+          npx tsc --noEmit &
+          TSC_PID=$!
+          npm run test:run
+          TEST_EXIT=$?
+          wait $TSC_PID
+          TSC_EXIT=$?
+          if [ $TEST_EXIT -ne 0 ] || [ $TSC_EXIT -ne 0 ]; then
+            exit 1
+          fi

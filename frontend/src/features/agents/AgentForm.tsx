@@ -1,0 +1,443 @@
+import React, { useEffect } from 'react'
+import { Modal, Form, Input, Select, InputNumber, Switch, AutoComplete, Button } from 'antd'
+import { XIcon, CaretDownIcon } from '@phosphor-icons/react'
+import { createStyles } from 'antd-style'
+import PrimaryButton from '@/components/PrimaryButton'
+import type { Agent, AgentConfig } from '@/api/agents'
+import { useCreateAgent, useUpdateAgent, useAgents } from '@/queries/useAgents'
+import { usePersonalities } from '@/queries/usePersonalities'
+import { agentIdentifierFormRules } from '@/utils/identifier'
+import { AGENT_ICON_OPTIONS, PRESET_COLORS, PRESET_BG_COLORS } from '@/utils/agent-icons'
+import { useTranslation } from 'react-i18next'
+import { getIconComponent, lightenHex } from '@/utils/icons'
+
+interface ToggleItemProps {
+  title: string
+  desc: string
+  checked?: boolean
+  onChange?: (checked: boolean) => void
+}
+
+function ToggleItem({ title, desc, checked, onChange }: ToggleItemProps) {
+  const { styles } = useStyles()
+  return (
+    <div className={styles.toggleRow} onClick={() => onChange?.(!checked)}>
+      <Switch size="small" checked={checked}
+        onChange={(v) => onChange?.(v)}
+        onClick={(_checked, ev) => { ev.stopPropagation(); }} />
+      <div className={styles.toggleText}>
+        <span className={styles.toggleName}>{title}</span>
+        <span className={styles.toggleDesc}>{desc}</span>
+      </div>
+    </div>
+  )
+}
+
+const useStyles = createStyles(({ css }) => ({
+  head: css`
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 18px 24px; border-bottom: 1px solid color-mix(in srgb, var(--foreground) 5%, transparent);
+  `,
+  title: css`font-size: 18px; font-weight: 600; color: var(--text); letter-spacing: -0.02em;`,
+  closeBtn: css`
+    width: 32px; height: 32px; display: flex; align-items: center; justify-content: center;
+    border: none; background: var(--ink-subtle); border-radius: 4px;
+    color: var(--text-tertiary); cursor: pointer; transition: all 0.15s;
+    &:hover { background: var(--ink-light); color: var(--text); }
+  `,
+  body: css`padding: 20px 24px 8px; max-height: 60vh; overflow-y: auto;`,
+  section: css`
+    font-size: 11px; font-weight: 600; color: var(--text-muted);
+    text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 14px;
+  `,
+  row: css`display: grid; grid-template-columns: 1fr 1fr; gap: 16px;`,
+  iconGrid: css`
+    display: grid; grid-template-columns: repeat(10, 1fr); gap: 4px;
+  `,
+  iconCell: css`
+    width: 32px; height: 32px; display: flex; align-items: center; justify-content: center;
+    border-radius: 4px; cursor: pointer; transition: all 0.15s;
+    border: 1px solid transparent; background: transparent;
+    &:hover { background: var(--ink-subtle); }
+  `,
+  iconCellActive: css`border-width: 1px; border-style: solid;`,
+  colorStrip: css`display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 8px;`,
+  colorDot: css`
+    width: 20px; height: 20px; border-radius: 50%; cursor: pointer;
+    border: 2px solid transparent; transition: border-color 0.15s;
+    &:hover { border-color: var(--ink-light); }
+  `,
+  colorDotOn: css`border-color: var(--ink) !important;`,
+  toggleRow: css`
+    display: flex; align-items: center; gap: 12px; padding: 12px 0;
+    cursor: pointer;
+    &:hover { background: var(--ink-subtle); border-radius: 4px; padding: 12px 8px; margin: 0 -8px; }
+  `,
+  toggleText: css`display: flex; flex-direction: column;`,
+  toggleName: css`font-size: 13px; font-weight: 500; color: var(--text);`,
+  toggleDesc: css`font-size: 11px; color: var(--text-muted);`,
+  foot: css`
+    display: flex; justify-content: flex-end; gap: 10px;
+    padding: 14px 24px; border-top: 1px solid color-mix(in srgb, var(--foreground) 5%, transparent);
+  `,
+  personalityNote: css`
+    display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px;
+    align-items: start; margin-top: -14px; color: var(--text-muted); font-size: 11px; line-height: 1.5;
+  `,
+  personalityVersion: css`
+    color: var(--primary); white-space: nowrap;
+    font: 650 10px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  `,
+}))
+
+interface AgentFormProps {
+  open: boolean
+  editingAgent: Agent | null
+  onClose: () => void
+}
+
+interface FormValues {
+  name: string
+  permissionMode: string
+  titleZh: string
+  titleEn: string
+  descriptionZh: string
+  descriptionEn: string
+  iconName: string
+  iconColor: string
+  iconBgColor: string
+  maxTurns: number
+  maxSessionQueries?: number
+  disallowedTools?: string[]
+  systemPrompt: string
+  desktopEnabled: boolean
+  mobileEnabled: boolean
+  guestEnabled: boolean
+  isDefault: boolean
+  group: string
+  personalityTemplateName: string
+}
+
+export default function AgentForm({ open, editingAgent, onClose }: AgentFormProps) {
+  const { styles } = useStyles()
+  const { t } = useTranslation()
+  const [form] = Form.useForm<FormValues>()
+  const createAgent = useCreateAgent()
+  const updateAgent = useUpdateAgent()
+  const submitting = createAgent.isPending || updateAgent.isPending
+  const { data: allAgents = [] } = useAgents()
+  const { data: personalities = [] } = usePersonalities()
+
+  // 提取去重后的 group 值
+  const groupOptions = React.useMemo(() => {
+    const groups = new Set<string>()
+    allAgents.forEach(agent => {
+      if (agent.group) {
+        groups.add(agent.group)
+      }
+    })
+    return Array.from(groups)
+      .sort((a, b) => a.localeCompare(b))
+      .map(g => ({ value: g, label: g }))
+  }, [allAgents])
+
+  const iconName = Form.useWatch('iconName', form)
+  const iconColor = Form.useWatch('iconColor', form)
+  const iconBgColor = Form.useWatch('iconBgColor', form)
+  const personalityTemplateName = Form.useWatch('personalityTemplateName', form)
+  const selectedPersonality = personalities.find((item) => item.name === personalityTemplateName)
+
+  useEffect(() => {
+    if (open) {
+      if (editingAgent) {
+        form.setFieldsValue({
+          name: editingAgent.name,
+          permissionMode: editingAgent.config.permissionMode ?? 'auto',
+          titleZh: editingAgent.config.title?.zh ?? '',
+          titleEn: editingAgent.config.title?.en ?? '',
+          descriptionZh: editingAgent.config.description?.zh ?? '',
+          descriptionEn: editingAgent.config.description?.en ?? '',
+          iconName: editingAgent.config.iconName ?? '',
+          iconColor: editingAgent.config.iconColor ?? '',
+          iconBgColor: editingAgent.config.iconBgColor ?? '',
+          maxTurns: editingAgent.config.maxTurns ?? 50,
+          maxSessionQueries: editingAgent.config.maxSessionQueries,
+          disallowedTools: editingAgent.config.disallowedTools ?? [],
+          systemPrompt: editingAgent.config.systemPrompt ?? '',
+          desktopEnabled: editingAgent.desktopEnabled ?? false,
+          mobileEnabled: editingAgent.mobileEnabled ?? false,
+          guestEnabled: editingAgent.guestEnabled ?? false,
+          isDefault: editingAgent.isDefault ?? false,
+          group: editingAgent.group ?? '',
+          personalityTemplateName: editingAgent.config.personalityTemplateName ?? ''
+        })
+      } else {
+        form.resetFields()
+        form.setFieldsValue({
+        permissionMode: 'auto', maxTurns: 50, desktopEnabled: false, mobileEnabled: false, guestEnabled: false, isDefault: false,
+        iconName: '', iconColor: '', iconBgColor: '', group: '', maxSessionQueries: undefined, disallowedTools: undefined,
+        personalityTemplateName: ''
+        })
+      }
+    }
+  }, [open, editingAgent, form])
+
+  const selectIcon = (name: string) => {
+    const current = form.getFieldValue('iconName') as FormValues['iconName']
+    if (current === name) {
+      form.setFieldsValue({ iconName: '' })
+      return
+    }
+    const opt = AGENT_ICON_OPTIONS.find((o) => o.name === name)
+    const currentColor = form.getFieldValue('iconColor') as FormValues['iconColor'] | undefined
+    const currentBg = form.getFieldValue('iconBgColor') as FormValues['iconBgColor'] | undefined
+    form.setFieldsValue({
+      iconName: name,
+      iconColor: currentColor ?? opt?.defaultColor ?? '',
+      iconBgColor: currentBg ?? (opt ? lightenHex(opt.defaultColor) : '')
+    })
+  }
+
+  const handleSubmit = async () => {
+    const v = await form.validateFields()
+    const config: AgentConfig = {
+      systemPrompt: v.systemPrompt,
+      permissionMode: v.permissionMode,
+      maxTurns: v.maxTurns,
+      maxSessionQueries: v.maxSessionQueries ?? undefined,
+      // undefined（新建未触碰）→ 不下发 key（hub 视为未配置）；编辑态清空后 antd Select 值为 []，
+      // 必须显式发空数组——hub applyUpdateConfig 对 absent key 不变更，丢 key 会让清空静默失效
+      disallowedTools: v.disallowedTools ?? undefined,
+      title: v.titleZh ? { zh: v.titleZh, ...(v.titleEn ? { en: v.titleEn } : {}) } : undefined,
+      description: v.descriptionZh
+        ? { zh: v.descriptionZh, ...(v.descriptionEn ? { en: v.descriptionEn } : {}) }
+        : undefined,
+      iconName: v.iconName || undefined,
+      iconColor: v.iconColor || undefined,
+      iconBgColor: v.iconBgColor || undefined,
+      group: v.group || '',
+      personalityTemplateName: v.personalityTemplateName || ''
+    }
+
+    if (editingAgent) {
+      await updateAgent.mutateAsync({
+        name: editingAgent.name,
+        data: { config, desktopEnabled: v.desktopEnabled, mobileEnabled: v.mobileEnabled, guestEnabled: v.guestEnabled, isDefault: v.isDefault }
+      })
+    } else {
+      await createAgent.mutateAsync({
+        name: v.name,
+        config,
+        desktopEnabled: v.desktopEnabled,
+        mobileEnabled: v.mobileEnabled,
+        guestEnabled: v.guestEnabled,
+        isDefault: v.isDefault
+      })
+    }
+    onClose()
+  }
+
+  return (
+    <Modal
+      open={open}
+      onCancel={onClose}
+      footer={null}
+      closable={false}
+      width={720}
+      styles={{ body: { padding: 0 } }}
+      title={null}
+      destroyOnHidden
+    >
+      <div className={styles.head}>
+        <div className={styles.title}>{editingAgent ? t('agents.form.editTitle') : t('agents.create')}</div>
+        <button type="button" className={styles.closeBtn} onClick={onClose}>
+          <XIcon size={18} />
+        </button>
+      </div>
+
+      <Form form={form} layout="vertical" className={styles.body} requiredMark={false}>
+        {/* 基本信息 */}
+        <div className={styles.section}>{t('agents.form.basicSection')}</div>
+        <div className={styles.row}>
+          <Form.Item label={t('agents.form.nameKey')} name="name" rules={agentIdentifierFormRules(t('agents.form.nameKey'))}>
+            <Input placeholder={t('agents.form.namePh')} disabled={!!editingAgent} />
+          </Form.Item>
+          <Form.Item label={t('agents.form.permissionMode')} name="permissionMode">
+            <Select options={[
+              { label: 'Auto', value: 'auto' },
+              { label: 'Plan', value: 'plan' },
+              { label: 'Bypass', value: 'bypassPermissions' }
+            ]} />
+          </Form.Item>
+        </div>
+        <Form.Item label={t('agents.form.group')} name="group">
+          <AutoComplete
+            options={groupOptions}
+            placeholder={t('agents.form.groupPh')}
+            allowClear
+            suffix={<CaretDownIcon size={14} />}
+            showSearch={{
+              filterOption: (inputValue, option) => {
+                const label = (option?.label ?? '').toLowerCase()
+                return label.includes(inputValue.toLowerCase())
+              },
+            }}
+          />
+        </Form.Item>
+
+        {/* 显示设置 */}
+        <div className={styles.section} style={{ marginTop: 20 }}>{t('agents.form.displaySection')}</div>
+        <div className={styles.row}>
+          <Form.Item label={t('agents.form.titleZh')} name="titleZh">
+            <Input placeholder={t('agents.form.titleZhPh')} />
+          </Form.Item>
+          <Form.Item label="English Title" name="titleEn">
+            <Input placeholder="Agent display name" />
+          </Form.Item>
+        </div>
+        <div className={styles.row}>
+          <Form.Item label={t('agents.form.descZh')} name="descriptionZh">
+            <Input placeholder={t('agents.form.descZhPh')} />
+          </Form.Item>
+          <Form.Item label="English Description" name="descriptionEn">
+            <Input placeholder="Brief description" />
+          </Form.Item>
+        </div>
+
+        {/* Icon picker */}
+        <Form.Item label={t('agents.form.icon')} name="iconName">
+          <div className={styles.iconGrid}>
+            {AGENT_ICON_OPTIONS.map((opt) => {
+              const IconCmp = getIconComponent(opt.name)
+              const active = iconName === opt.name
+              const activeColor = iconColor || opt.defaultColor
+              const activeBg = iconBgColor || lightenHex(activeColor, 0.12)
+              return (
+                <button
+                  key={opt.name}
+                  type="button"
+                  className={`${styles.iconCell} ${active ? styles.iconCellActive : ''}`}
+                  style={active ? {
+                    backgroundColor: activeBg,
+                    borderColor: activeColor
+                  } : {}}
+                  title={t(opt.label)}
+                  onClick={(e) => { e.stopPropagation(); selectIcon(opt.name) }}
+                >
+                  <IconCmp size={18} weight="duotone" color={active ? activeColor : '#9CA3AF'} />
+                </button>
+              )
+            })}
+          </div>
+        </Form.Item>
+
+        {/* Color pickers */}
+        <div className={styles.row}>
+          <Form.Item label={t('agents.form.iconColor')} name="iconColor">
+            <div>
+              <div className={styles.colorStrip}>
+                {PRESET_COLORS.map((c) => (
+                  <span
+                    key={c}
+                    className={`${styles.colorDot} ${iconColor === c ? styles.colorDotOn : ''}`}
+                    style={{ backgroundColor: c }}
+                    onClick={(e) => { e.stopPropagation(); form.setFieldsValue({ iconColor: c }) }}
+                  />
+                ))}
+              </div>
+              <Input size="small" placeholder="#1A3A5C" value={iconColor}
+                onChange={(e) => { form.setFieldsValue({ iconColor: e.target.value }); }} />
+            </div>
+          </Form.Item>
+          <Form.Item label={t('agents.form.iconBg')} name="iconBgColor">
+            <div>
+              <div className={styles.colorStrip}>
+                  {PRESET_BG_COLORS.map((c) => (
+                    <span
+                      key={c}
+                      className={`${styles.colorDot} ${iconBgColor === c ? styles.colorDotOn : ''}`}
+                      style={{ backgroundColor: c }}
+                      onClick={(e) => { e.stopPropagation(); form.setFieldsValue({ iconBgColor: c }) }}
+                    />
+                  ))}
+              </div>
+              <Input size="small" placeholder="#EBF0FF" value={form.getFieldValue('iconBgColor') as string}
+                onChange={(e) => { form.setFieldsValue({ iconBgColor: e.target.value }); }} />
+            </div>
+          </Form.Item>
+        </div>
+
+        {/* 能力配置 */}
+        <div className={styles.section} style={{ marginTop: 20 }}>{t('agents.form.abilitySection')}</div>
+        <Form.Item label={t('agents.form.maxTurns')} name="maxTurns">
+          <InputNumber min={1} max={500} style={{ width: '100%' }} />
+        </Form.Item>
+        <Form.Item label={t('agents.form.maxSessionQueries')} name="maxSessionQueries" tooltip={t('agents.form.maxSessionQueriesTip')}>
+          <InputNumber min={1} placeholder={t('agents.form.noLimit')} style={{ width: '100%' }} />
+        </Form.Item>
+        <Form.Item label={t('agents.form.disallowedTools')} name="disallowedTools" tooltip={t('agents.form.disallowedToolsTip')}>
+          <Select mode="tags" open={false} tokenSeparators={[',']} placeholder={t('agents.form.disallowedToolsPh')} style={{ width: '100%' }} />
+        </Form.Item>
+
+        {/* 人格只从独立人格库引用，原稿与投影不在 Agent 页面重复维护。 */}
+        <div className={styles.section} style={{ marginTop: 20 }}>人格</div>
+        <Form.Item label="人格模板" name="personalityTemplateName">
+          <Select
+            showSearch={{ optionFilterProp: 'label' }}
+            allowClear
+            placeholder="不设置人格"
+            options={personalities.filter((item) => item.enabled || item.name === personalityTemplateName).map((item) => ({
+              value: item.name,
+              label: `${item.title} · v${item.currentVersion}`,
+            }))}
+          />
+        </Form.Item>
+        <div className={styles.personalityNote}>
+          <span>{selectedPersonality?.description.trim() ? selectedPersonality.description : '人格内容统一在人格库中创建和维护；Agent 页面只负责选择。'}</span>
+          {selectedPersonality ? <span className={styles.personalityVersion}>保存 v{selectedPersonality.currentVersion}</span> : null}
+        </div>
+
+        {/* Agent 自身的身份与工作边界，不承载人格。 */}
+        <div className={styles.section} style={{ marginTop: 20 }}>职责与任务</div>
+        <Form.Item name="systemPrompt" extra="只写这个 Agent 负责什么；表达方式和决策倾向由所选人格决定。">
+          <Input.TextArea placeholder={t('agents.form.promptPh')} rows={6} maxLength={20000} showCount />
+        </Form.Item>
+
+        {/* Toggles */}
+        <div style={{ marginTop: 20 }}>
+          <Form.Item name="desktopEnabled" valuePropName="checked" style={{ marginBottom: 0 }}>
+            <ToggleItem
+              title={t('agents.form.desktopTitle')}
+              desc={t('agents.form.desktopDesc')}
+            />
+          </Form.Item>
+          <Form.Item name="guestEnabled" valuePropName="checked" style={{ marginBottom: 0 }}>
+            <ToggleItem
+              title={t('agents.form.guestTitle')}
+              desc={t('agents.form.guestDesc')}
+            />
+          </Form.Item>
+          <Form.Item name="mobileEnabled" valuePropName="checked" style={{ marginBottom: 0 }}>
+            <ToggleItem
+              title={t('agents.form.mobileTitle')}
+              desc={t('agents.form.mobileDesc')}
+            />
+          </Form.Item>
+          <Form.Item name="isDefault" valuePropName="checked" style={{ marginBottom: 0 }}>
+            <ToggleItem
+              title={t('agents.form.defaultTitle')}
+              desc={t('agents.form.defaultDesc')}
+            />
+          </Form.Item>
+        </div>
+      </Form>
+
+      <div className={styles.foot}>
+        <Button onClick={onClose}>{t('common.cancel')}</Button>
+        <PrimaryButton onClick={handleSubmit} loading={submitting}>
+          {editingAgent ? t('agents.form.save') : t('agents.form.createSubmit')}
+        </PrimaryButton>
+      </div>
+    </Modal>
+  )
+}

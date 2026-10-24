@@ -1,0 +1,350 @@
+import { useEffect, useState } from 'react'
+import { useTranslation } from 'react-i18next'
+import { Modal, Form, Input, Upload, Button } from 'antd'
+import type { UploadProps } from 'antd'
+import { XIcon, UploadSimpleIcon } from '@phosphor-icons/react'
+import { createStyles } from 'antd-style'
+import PrimaryButton from '@/components/PrimaryButton'
+import type { Tool } from '@/api/tools'
+import { useCreateCustomTool, useUploadToolFile, useUpdateTool } from '@/queries/useTools'
+import { identifierFormRules } from '@/utils/identifier'
+import { tokens as t } from '@/styles/tokens'
+
+export type ToolFormMode = 'create' | 'edit' | 'upload'
+
+// 与 deployer 契约一致：扩展名大小写敏感
+const ALLOWED_EXTENSIONS = ['.ts', '.mts', '.js', '.mjs']
+const MAX_FILE_SIZE = 5 * 1024 * 1024
+
+// 三种表单模式（create/edit/upload）的全部 UI 显隐与校验差异集中于此；
+// 组件内除提交时的三路 API 调用序列外不再出现 mode 分支
+interface ToolFormModeConfig {
+  title: string // modal 标题
+  submitText: string // 主按钮文案
+  showMetadata: boolean // name/title/description 元数据字段区
+  showNameField: boolean // 工具标识输入（含"基本信息"区块）
+  nameEditable: boolean // 工具标识仅 create 可编辑，其余 disabled
+  fileRequired: boolean // 提交前必须已选文件
+  fileSectionTitle: string // 文件区小节标题
+  fileHint: string // 文件区引导文案（空串 = 不渲染；有 uploadError 时隐藏）
+  showTrustHints: boolean // 三行可信代码安全提示
+  prefillFromTool: boolean // 打开时用 editingTool 预填元数据（false = 重置表单）
+}
+
+const TOOL_FORM_MODES: Record<ToolFormMode, ToolFormModeConfig> = {
+  create: {
+    title: 'tools.form.uploadTitle',
+    submitText: 'tools.form.uploadSubmit',
+    showMetadata: true,
+    showNameField: true,
+    nameEditable: true,
+    fileRequired: true,
+    fileSectionTitle: 'tools.form.toolFileSection',
+    fileHint: '',
+    showTrustHints: true,
+    prefillFromTool: false
+  },
+  edit: {
+    title: 'tools.form.editToolTitle',
+    submitText: 'tools.form.updateSubmit',
+    showMetadata: true,
+    showNameField: true,
+    nameEditable: false,
+    fileRequired: false,
+    fileSectionTitle: 'tools.form.replaceFileOptional',
+    fileHint: 'tools.form.keepFile',
+    showTrustHints: false,
+    prefillFromTool: true
+  },
+  upload: {
+    title: 'tools.form.repairTitle',
+    submitText: 'tools.form.repairSubmit',
+    showMetadata: false,
+    showNameField: false,
+    nameEditable: false,
+    fileRequired: true,
+    fileSectionTitle: 'tools.form.toolFileSection',
+    fileHint: 'tools.form.uploadHint',
+    showTrustHints: false,
+    prefillFromTool: true
+  }
+}
+
+const useStyles = createStyles(({ css }) => ({
+  modalHead: css`
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 18px 24px;
+    border-bottom: 1px solid color-mix(in srgb, var(--foreground) 5%, transparent);
+  `,
+  modalTitle: css`
+    font-size: 18px;
+    font-weight: 600;
+    color: var(--text);
+    letter-spacing: -0.02em;
+  `,
+  modalClose: css`
+    width: 32px;
+    height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: none;
+    background: var(--ink-subtle);
+    border-radius: 4px;
+    color: var(--text-tertiary);
+    cursor: pointer;
+    transition: all 0.15s;
+    &:hover {
+      background: var(--ink-light);
+      color: var(--text);
+    }
+  `,
+  modalBody: css`
+    padding: 20px 24px 8px;
+    max-height: 60vh;
+    overflow-y: auto;
+  `,
+  sectionTitle: css`
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 14px;
+  `,
+  uploadBtn: css`
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 16px;
+    background: var(--paper);
+    color: var(--text-secondary);
+    border: 1px dashed color-mix(in srgb, var(--foreground) 20%, transparent);
+    border-radius: 4px;
+    font-family: ${t.fontSans};
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.15s;
+    &:hover {
+      border-color: var(--ink);
+      color: var(--ink);
+    }
+  `,
+  uploadError: css`
+    margin-top: 8px;
+    font-size: 12px;
+    color: ${t.danger};
+  `,
+  uploadHint: css`
+    margin-top: 8px;
+    font-size: 12px;
+    color: ${t.textTertiary};
+  `,
+  hintBlock: css`
+    margin-top: 16px;
+    padding: 10px 12px;
+    background: var(--ink-subtle);
+    border-radius: 4px;
+    font-size: 12px;
+    color: var(--text-tertiary);
+    line-height: 1.8;
+  `,
+  modalFoot: css`
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+    padding: 14px 24px;
+    border-top: 1px solid color-mix(in srgb, var(--foreground) 5%, transparent);
+  `
+}))
+
+export interface ToolFormProps {
+  open: boolean
+  mode: ToolFormMode
+  editingTool: Tool | null
+  onClose: () => void
+}
+
+interface FormValues {
+  name: string
+  title: string
+  description: string
+  descriptionEn: string
+}
+
+export default function ToolForm({ open, mode, editingTool, onClose }: ToolFormProps) {
+  const { t } = useTranslation()
+  const { styles } = useStyles()
+  const [form] = Form.useForm<FormValues>()
+  const createCustomTool = useCreateCustomTool()
+  const updateTool = useUpdateTool()
+  const uploadToolFile = useUploadToolFile()
+  const submitting = createCustomTool.isPending || updateTool.isPending || uploadToolFile.isPending
+
+  const [selectedFile, setSelectedFile] = useState<File | null>(null)
+  const [uploadError, setUploadError] = useState('')
+  const cfg = TOOL_FORM_MODES[mode]
+
+  useEffect(() => {
+    if (open) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- reset upload-related local state on modal open; coupled to the antd form.setFieldsValue below
+      setSelectedFile(null)
+      setUploadError('')
+      if (!cfg.prefillFromTool || !editingTool) {
+        form.resetFields()
+      } else {
+        form.setFieldsValue({
+          name: editingTool.name,
+          title: editingTool.title || '',
+          description: editingTool.description || '',
+          // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing -- D2: empty EN string must also fall back to CN, `??` would pass it through
+          descriptionEn: editingTool.descriptionEn || ''
+        })
+      }
+    }
+  }, [open, cfg, editingTool, form])
+
+  const beforeUpload: UploadProps['beforeUpload'] = (file) => {
+    const ext = file.name.substring(file.name.lastIndexOf('.'))
+    if (!ALLOWED_EXTENSIONS.includes(ext)) {
+      // 校验失败必须同时清掉已持有的文件，否则按钮仍显示旧文件名、提交会带上旧文件
+      setSelectedFile(null)
+      setUploadError(t('tools.form.fileTypeError'))
+      return Upload.LIST_IGNORE
+    }
+    if (file.size === 0) {
+      setSelectedFile(null)
+      setUploadError(t('tools.form.fileEmpty'))
+      return Upload.LIST_IGNORE
+    }
+    if (file.size > MAX_FILE_SIZE) {
+      setSelectedFile(null)
+      setUploadError(t('tools.form.fileTooBig'))
+      return Upload.LIST_IGNORE
+    }
+    setUploadError('')
+    setSelectedFile(file)
+    return false // prevent auto-upload
+  }
+
+  const handleSubmit = async () => {
+    const file = selectedFile
+    if (cfg.fileRequired && !file) {
+      setUploadError(t('tools.form.fileRequired'))
+      return
+    }
+
+    // 以下三路 API 调用序列（upload 单传文件 / create 建工具 / edit 先改元数据再可选替换文件）
+    // 是固有业务逻辑，为组件内仅存的 mode 分支；元数据校验只发生在 showMetadata 的分支中
+    if (mode === 'upload') {
+      if (!editingTool || !file) return
+      await uploadToolFile.mutateAsync({ name: editingTool.name, file })
+      onClose()
+      return
+    }
+
+    const values = await form.validateFields()
+    if (mode === 'create') {
+      if (!file) return
+      await createCustomTool.mutateAsync({
+        name: values.name,
+        title: values.title,
+        description: values.description,
+        descriptionEn: values.descriptionEn,
+        file
+      })
+    } else {
+      if (!editingTool) return
+      // 先更新元数据，再（可选）上传替换文件
+      await updateTool.mutateAsync({
+        name: editingTool.name,
+        data: { title: values.title, description: values.description, descriptionEn: values.descriptionEn }
+      })
+      if (file) {
+        await uploadToolFile.mutateAsync({ name: editingTool.name, file })
+      }
+    }
+    onClose()
+  }
+
+  return (
+    <Modal
+      open={open}
+      onCancel={onClose}
+      footer={null}
+      closable={false}
+      width={560}
+      styles={{ body: { padding: 0 } }}
+      title={null}
+      destroyOnHidden
+    >
+      <div className={styles.modalHead}>
+        <div className={styles.modalTitle}>{t(cfg.title)}</div>
+        <button type="button" className={styles.modalClose} onClick={onClose}>
+          <XIcon size={18} />
+        </button>
+      </div>
+
+      <Form form={form} layout="vertical" className={styles.modalBody} requiredMark={false}>
+        {cfg.showMetadata && (
+          <>
+            {cfg.showNameField && (
+              <>
+                <div className={styles.sectionTitle}>{t('tools.form.basicSection')}</div>
+                <Form.Item
+                  label={t('tools.form.nameKey')}
+                  name="name"
+                  rules={identifierFormRules(t('tools.form.nameKey'))}
+                >
+                  <Input placeholder="e.g. SayHello" disabled={!cfg.nameEditable} />
+                </Form.Item>
+              </>
+            )}
+
+            <div className={styles.sectionTitle} style={{ marginTop: 20 }}>{t('tools.form.displaySection')}</div>
+            <Form.Item label={t('tools.form.titleLabel')} name="title">
+              <Input placeholder={t('tools.form.titlePlaceholder')} />
+            </Form.Item>
+            <Form.Item label={t('tools.form.descLabel')} name="description">
+              <Input.TextArea placeholder={t('tools.form.descPlaceholder')} rows={3} />
+            </Form.Item>
+            <Form.Item label="Description (EN)" name="descriptionEn">
+              <Input.TextArea placeholder="Tool description in English (optional)" rows={3} />
+            </Form.Item>
+          </>
+        )}
+
+        <div className={styles.sectionTitle} style={{ marginTop: cfg.showMetadata ? 20 : 0 }}>
+          {t(cfg.fileSectionTitle)}
+        </div>
+        <Upload beforeUpload={beforeUpload} showUploadList={false} accept=".ts,.mts,.js,.mjs" maxCount={1}>
+          <button type="button" className={styles.uploadBtn}>
+            <UploadSimpleIcon size={16} />
+            {selectedFile ? selectedFile.name : t('tools.form.selectFile')}
+          </button>
+        </Upload>
+        {uploadError && <div className={styles.uploadError}>{uploadError}</div>}
+        {cfg.fileHint && !uploadError && (
+          <div className={styles.uploadHint}>{t(cfg.fileHint)}</div>
+        )}
+        {cfg.showTrustHints && (
+          <div className={styles.hintBlock}>
+            <div>· {t('tools.form.hint1')}</div>
+            <div>· {t('tools.form.hint2')}</div>
+            <div>· {t('tools.form.hint3')}</div>
+          </div>
+        )}
+      </Form>
+
+      <div className={styles.modalFoot}>
+        <Button onClick={onClose}>{t('common.cancel')}</Button>
+        <PrimaryButton onClick={handleSubmit} loading={submitting}>
+          {t(cfg.submitText)}
+        </PrimaryButton>
+      </div>
+    </Modal>
+  )
+}

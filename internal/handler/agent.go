@@ -1,0 +1,514 @@
+package handler
+
+import (
+	"errors"
+	"fmt"
+	"log"
+	"net/http"
+	"strings"
+
+	"control-panel/internal/application/services"
+	"control-panel/internal/auth/jwtutil"
+	"control-panel/internal/domain/agent"
+	"control-panel/internal/domain/audit"
+	"control-panel/internal/domain/provider"
+	"control-panel/internal/domain/tenant"
+	"control-panel/internal/infrastructure/deployer"
+
+	"github.com/gin-gonic/gin"
+)
+
+type AgentHandler struct {
+	service         *services.AgentService
+	deployerService *services.AgentDeployerService
+	audit           *services.AuditRecorder
+}
+
+func NewAgentHandler(service *services.AgentService, deployerService *services.AgentDeployerService, ar *services.AuditRecorder) *AgentHandler {
+	return &AgentHandler{
+		service:         service,
+		deployerService: deployerService,
+		audit:           ar,
+	}
+}
+
+// respondAgentError 映射 Agent 领域错误（issue #95 P2 同款边界分流）：
+// 领域 sentinel（ErrAgentNotFound）→ 404 用户面文案；用户面校验错误
+// （ValidationError）→ 400 完整链原文（外层 wrap 携带上下文必须保留）；
+// 基础设施故障（DB/加解密）→ 500 中性文案，完整错误链只在服务端日志。
+//
+// 404 分支只认 Agent/Provider 专属 sentinel（外审 #5612003511 P2）：
+// gorm.ErrRecordNotFound 是泛化错误，可能来自 builtin MCP 等非 Agent 实体
+// ——双认会把它们误判为「Agent 不存在」且吞掉诊断日志。service 层已在
+// not-found 时按 errors.Is(gorm.ErrRecordNotFound) 区分并包装专属 sentinel
+// （agent.ErrAgentNotFound / provider.ErrProviderNotFound），其余错误走
+// 英文诊断；因此 handler 仅需认 sentinel 即可，DB 故障仍落入 500 中性桶，
+// 绝不伪装 not-found。
+func respondAgentError(c *gin.Context, err error) {
+	switch {
+	// 仅 Agent/Provider 专属 sentinel 映射 404（外审 #5612003511 P2：
+	// gorm.ErrRecordNotFound 是泛化错误，可能来自 builtin MCP 等非
+	// Agent 实体——双认会把它们误判为「Agent 不存在」且吞掉诊断日志；
+	// service 层已在 not-found 时包装专属 sentinel）。
+	case errors.Is(err, agent.ErrAgentNotFound):
+		respondError(c, http.StatusNotFound, agent.ErrAgentNotFound.Error())
+	case errors.Is(err, provider.ErrProviderNotFound):
+		// provider 域 sentinel 是英文文案（"provider not found"），
+		// HTTP 边界按用户面中文提示返回（外审 #5614465831 P3）。
+		respondError(c, http.StatusNotFound, "Provider 不存在")
+	default:
+		var ve *agent.ValidationError
+		if errors.As(err, &ve) {
+			respondError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		log.Printf("[AgentHandler] internal error: %v", err)
+		respondError(c, http.StatusInternalServerError, "服务器内部错误，请稍后重试")
+	}
+}
+
+func (h *AgentHandler) Manifest(c *gin.Context) {
+	resp, err := h.service.GetManifest(tenant.GetTenantID(c), c.Query("platform"), jwtutil.IsGuest(c))
+	if err != nil {
+		respondAgentError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    resp,
+	})
+}
+
+// List 返回公开 Agent 列表。view=chat（query 参数，guard 白名单按 URL.Path
+// 匹配故不涉及 guard）走聊天主页/切换器视图：无 platform 过滤，guest 只见
+// guest-enabled；缺省视图维持 desktop 语义，guest 同样叠加 guest 过滤。
+func (h *AgentHandler) List(c *gin.Context) {
+	guest := jwtutil.IsGuest(c)
+	var resp *services.AgentsDTO
+	var err error
+	if c.Query("view") == "chat" {
+		resp, err = h.service.GetChatAgents(tenant.GetTenantID(c), guest)
+	} else {
+		resp, err = h.service.GetDesktopAgents(tenant.GetTenantID(c), guest)
+	}
+	if err != nil {
+		respondAgentError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    resp,
+	})
+}
+
+func (h *AgentHandler) ListAdmin(c *gin.Context) {
+	resp, err := h.service.GetAllAgentsAdmin(tenant.GetTenantID(c))
+	if err != nil {
+		respondAgentError(c, err)
+		return
+	}
+
+	// 待更新工件提示（issue #86）：逐 agent 比对快照与当前绑定哈希。
+	for i := range resp.Agents {
+		pending, perr := h.deployerService.ComputePendingArtifacts(c.Request.Context(), tenant.GetTenantID(c), resp.Agents[i].ID)
+		if perr != nil {
+			// fail-open：pending 是提示非授权，记录日志不阻塞列表
+			log.Printf("compute pending artifacts for agent %d failed: %v", resp.Agents[i].ID, perr)
+			continue
+		}
+		resp.Agents[i].PendingArtifactUpdates = pending
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    resp,
+	})
+}
+
+func (h *AgentHandler) Get(c *gin.Context) {
+	name := c.Param("name")
+
+	// guest 访问未开放 Agent 时与真不存在同形（spec 7 防枚举）：
+	// AgentGuestVisible 对 not-found 返回 (false, nil)，此处统一走
+	// ErrAgentNotFound sentinel → respondAgentError 渲染的字节与
+	// GetAgent 的真实 not-found 路径完全一致；infra 故障仍落入 500。
+	if jwtutil.IsGuest(c) {
+		visible, err := h.service.AgentGuestVisible(tenant.GetTenantID(c), name)
+		if err != nil {
+			respondAgentError(c, err)
+			return
+		}
+		if !visible {
+			respondAgentError(c, fmt.Errorf("%w: %s", agent.ErrAgentNotFound, name))
+			return
+		}
+	}
+
+	resp, err := h.service.GetAgent(tenant.GetTenantID(c), name)
+	if err != nil {
+		// 行为修正（原「所有错误一律 404」）：not-found 走 404，
+		// 其余错误由 respondAgentError 分流（VAL 400 / 基础设施 500）。
+		respondAgentError(c, err)
+		return
+	}
+
+	// 待更新工件提示（issue #86）：fail-open，比对失败只记日志不阻塞详情。
+	pending, perr := h.deployerService.ComputePendingArtifacts(c.Request.Context(), tenant.GetTenantID(c), resp.ID)
+	if perr != nil {
+		log.Printf("compute pending artifacts for agent %s failed: %v", name, perr)
+	} else {
+		resp.PendingArtifactUpdates = pending
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    resp,
+	})
+}
+
+type createAgentReq struct {
+	Name           string                 `json:"name" binding:"required"`
+	Config         map[string]interface{} `json:"config" binding:"required"`
+	DesktopEnabled *bool                  `json:"desktopEnabled"`
+	MobileEnabled  *bool                  `json:"mobileEnabled"`
+	GuestEnabled   *bool                  `json:"guestEnabled"`
+	IsDefault      *bool                  `json:"isDefault"`
+}
+
+func (h *AgentHandler) Create(c *gin.Context) {
+	var req createAgentReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	resp, err := h.service.CreateAgent(tenant.GetTenantID(c), &services.CreateAgentInput{
+		Name:           req.Name,
+		Config:         req.Config,
+		DesktopEnabled: req.DesktopEnabled,
+		MobileEnabled:  req.MobileEnabled,
+		GuestEnabled:   req.GuestEnabled,
+		IsDefault:      req.IsDefault,
+	})
+	if err != nil {
+		respondAgentError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusCreated, gin.H{
+		"success": true,
+		"data":    resp,
+	})
+}
+
+type updateAgentReq struct {
+	Config         *map[string]interface{} `json:"config"`
+	DesktopEnabled *bool                   `json:"desktopEnabled"`
+	MobileEnabled  *bool                   `json:"mobileEnabled"`
+	GuestEnabled   *bool                   `json:"guestEnabled"`
+	IsDefault      *bool                   `json:"isDefault"`
+	Source         string                  `json:"source"`
+}
+
+func (h *AgentHandler) Update(c *gin.Context) {
+	name := c.Param("name")
+
+	var req updateAgentReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	resp, err := h.service.UpdateAgent(tenant.GetTenantID(c), name, &services.UpdateAgentInput{
+		Config:         req.Config,
+		DesktopEnabled: req.DesktopEnabled,
+		MobileEnabled:  req.MobileEnabled,
+		GuestEnabled:   req.GuestEnabled,
+		IsDefault:      req.IsDefault,
+		Source:         req.Source,
+	})
+	if err != nil {
+		respondAgentError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    resp,
+	})
+}
+
+func (h *AgentHandler) Delete(c *gin.Context) {
+	name := c.Param("name")
+
+	// Reject deletion when the agent still has a live deployment. GetStatus
+	// syncs the real container state from the deployer, so its result is
+	// authoritative. "not_found" and "archived" mean no container is running
+	// (archived = container removed but data retained by the deployer).
+	// Fail-closed（bulk-ops spec §3.1）：GetStatus 失败（deployer 故障或 agent
+	// 不在 DB）时状态不可确认，阻止删除——否则 deployer 故障会绕过 409 检查
+	// 误删仍有容器的配置。DB not-found 也走此分支（UI 过期边缘场景，刷新自愈）。
+	deployment, err := h.deployerService.GetStatus(tenant.GetTenantID(c), name)
+	if err != nil {
+		respondError(c, http.StatusBadGateway, "无法确认部署状态，已阻止删除")
+		return
+	}
+	if s := deployment.Status; s != "" && s != "not_found" && s != "archived" {
+		c.JSON(http.StatusConflict, gin.H{
+			"success": false,
+			"error":   fmt.Sprintf("该 Agent 仍有活跃部署（状态: %s），请先在部署面板中删除部署后再删除 Agent", s),
+		})
+		return
+	}
+
+	if err := h.service.DeleteAgent(tenant.GetTenantID(c), name); err != nil {
+		respondAgentError(c, err)
+		return
+	}
+	h.audit.Simple(c, audit.ActionDelete, audit.TargetAgent, name, name)
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "Agent 已删除",
+	})
+}
+
+type probeAgentReq struct {
+	ProviderID *uint64 `json:"providerId"`
+	APIKey     string  `json:"apiKey"`
+	BaseURL    string  `json:"baseUrl"`
+}
+
+func (h *AgentHandler) ProbeAgent(c *gin.Context) {
+	name := c.Param("name")
+
+	var req probeAgentReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	result, err := h.service.ProbeAgent(tenant.GetTenantID(c), name, req.ProviderID, req.APIKey, req.BaseURL)
+	if err != nil {
+		respondAgentError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    result,
+	})
+}
+
+// deployerErrorStatus maps deployer failures to hub response codes. Typed
+// deployer.HTTPError values (see decodeSuccess) win first: deployer v3 4xx
+// (protocol rejections) and 503 (runtime version floor below requirement)
+// pass through as-is, while other upstream 5xx failures surface as 502.
+// Non-HTTPError errors fall through to the legacy string matching, which
+// keeps mapping hub-side validation failures (e.g. "agent has no provider").
+func deployerErrorStatus(err error) int {
+	// Capability gate (issue #114): a pre-v3.1 deployer is an environment
+	// problem, not a bad request — 503 with the actionable sentinel message.
+	if errors.Is(err, services.ErrDeployerNoDeploymentKey) {
+		return http.StatusServiceUnavailable
+	}
+	var httpErr *deployer.HTTPError
+	if errors.As(err, &httpErr) {
+		switch {
+		case httpErr.StatusCode >= 400 && httpErr.StatusCode < 500:
+			return httpErr.StatusCode
+		case httpErr.StatusCode == http.StatusServiceUnavailable:
+			return http.StatusServiceUnavailable
+		default:
+			return http.StatusBadGateway
+		}
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "agent has no provider") ||
+		strings.Contains(msg, "agent has no model") ||
+		strings.Contains(msg, "agent not found") {
+		return http.StatusBadRequest
+	}
+	// Capability probe transport failures (issue #114): the deployer itself
+	// could not be reached — a gateway problem, not an internal one.
+	if errors.Is(err, services.ErrDeployerCapabilityProbe) {
+		return http.StatusBadGateway
+	}
+	return http.StatusInternalServerError
+}
+
+// deployerErrorMessage maps the capability-gate errors (issue #114) to
+// stable Chinese user-facing copy (CONTRIBUTING.md: user-facing errors in
+// Chinese; internal errors in English). The English technical detail goes
+// to the log only and never reaches the API response. All other errors
+// keep their original message.
+func deployerErrorMessage(err error) string {
+	if errors.Is(err, services.ErrDeployerNoDeploymentKey) {
+		log.Printf("[Deploy] capability gate blocked deployment: %v", err)
+		return "agent-deployer 版本过低（需 ≥ v3.1.0），已阻止本次部署：请先升级 agent-deployer 后重试，升级顺序见 docs/configuration.md"
+	}
+	if errors.Is(err, services.ErrDeployerCapabilityProbe) {
+		log.Printf("[Deploy] capability probe transport failure: %v", err)
+		return "无法连接 agent-deployer 完成能力校验，已阻止本次部署：请检查 agent-deployer 服务状态后重试"
+	}
+	return err.Error()
+}
+
+func (h *AgentHandler) DeployAgent(c *gin.Context) {
+	name := c.Param("name")
+	force := c.Query("force") == "true"
+	rotateKey := c.Query("rotate_key") == "true"
+
+	resp, err := h.deployerService.Deploy(tenant.GetTenantID(c), name, force, rotateKey)
+	if err != nil {
+		respondError(c, deployerErrorStatus(err), deployerErrorMessage(err))
+		return
+	}
+	h.audit.Simple(c, audit.ActionDeploy, audit.TargetAgent, name, name)
+	respondSuccess(c, resp)
+}
+
+func (h *AgentHandler) GetDeployment(c *gin.Context) {
+	name := c.Param("name")
+
+	resp, err := h.deployerService.GetStatus(tenant.GetTenantID(c), name)
+	if err != nil {
+		respondAgentError(c, err)
+		return
+	}
+
+	// 待更新工件提示（issue #86）：deploy-status 路径只有 name，走
+	// ByName 解析；fail-open，比对失败只记日志不阻塞状态返回。
+	pending, perr := h.deployerService.ComputePendingArtifactsByName(c.Request.Context(), tenant.GetTenantID(c), name)
+	if perr != nil {
+		log.Printf("compute pending artifacts for agent %s failed: %v", name, perr)
+	} else {
+		resp.PendingArtifactUpdates = pending
+	}
+	respondSuccess(c, resp)
+}
+
+func (h *AgentHandler) StopDeployment(c *gin.Context) {
+	name := c.Param("name")
+
+	if err := h.deployerService.Stop(tenant.GetTenantID(c), name); err != nil {
+		respondError(c, deployerErrorStatus(err), deployerErrorMessage(err))
+		return
+	}
+	h.audit.Simple(c, audit.ActionStop, audit.TargetAgent, name, name)
+	respondMessage(c, http.StatusOK, "已停止")
+}
+
+func (h *AgentHandler) StartDeployment(c *gin.Context) {
+	name := c.Param("name")
+
+	resp, err := h.deployerService.Start(tenant.GetTenantID(c), name)
+	if err != nil {
+		respondError(c, deployerErrorStatus(err), deployerErrorMessage(err))
+		return
+	}
+	h.audit.Simple(c, audit.ActionStart, audit.TargetAgent, name, name)
+	respondSuccess(c, resp)
+}
+
+func (h *AgentHandler) DeleteDeployment(c *gin.Context) {
+	name := c.Param("name")
+	purge := c.Query("purge") == "true"
+
+	var err error
+	if purge {
+		err = h.deployerService.Purge(tenant.GetTenantID(c), name)
+	} else {
+		err = h.deployerService.Delete(tenant.GetTenantID(c), name)
+	}
+	if err != nil {
+		respondError(c, deployerErrorStatus(err), deployerErrorMessage(err))
+		return
+	}
+	h.audit.Simple(c, audit.ActionUndeploy, audit.TargetAgent, name, name)
+	if purge {
+		respondMessage(c, http.StatusOK, "已彻底删除")
+	} else {
+		respondMessage(c, http.StatusOK, "已归档")
+	}
+}
+
+type updateSubagentsReq struct {
+	Subagents []string `json:"subagents" binding:"required"`
+}
+
+func (h *AgentHandler) UpdateSubagents(c *gin.Context) {
+	name := c.Param("name")
+
+	var req updateSubagentsReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	if err := h.service.UpdateSubagents(tenant.GetTenantID(c), name, req.Subagents); err != nil {
+		respondAgentError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "子 Agent 关系已更新",
+	})
+}
+
+type updateAgentKnowledgeReq struct {
+	DatasetIDs []string `json:"dataset_ids"`
+}
+
+func (h *AgentHandler) GetAgentKnowledge(c *gin.Context) {
+	name := c.Param("name")
+	datasetIDs, err := h.service.GetAgentKnowledgeDatasets(tenant.GetTenantID(c), name)
+	if err != nil {
+		respondAgentError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data": map[string]interface{}{
+			"agent":       name,
+			"dataset_ids": datasetIDs,
+		},
+	})
+}
+
+func (h *AgentHandler) UpdateAgentKnowledge(c *gin.Context) {
+	name := c.Param("name")
+	var req updateAgentKnowledgeReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	if err := h.service.UpdateAgentKnowledgeDatasets(tenant.GetTenantID(c), name, req.DatasetIDs); err != nil {
+		respondAgentError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "Agent 知识库绑定已更新",
+	})
+}

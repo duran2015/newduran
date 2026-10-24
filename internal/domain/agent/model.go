@@ -1,0 +1,184 @@
+package agent
+
+import (
+	"time"
+
+	"control-panel/internal/domain/skill"
+)
+
+type AgentConfig struct {
+	ID               uint64            `gorm:"primaryKey;autoIncrement"`
+	Name             string            `gorm:"type:varchar(64);uniqueIndex:uk_agents_tenant_name,priority:2;not null"`
+	TenantID         string            `gorm:"type:varchar(64);not null;default:'';uniqueIndex:uk_agents_tenant_name,priority:1;index"`
+	ContentHash      string            `gorm:"column:content_hash;type:varchar(128);not null"`
+	SystemPrompt     string            `gorm:"column:system_prompt;type:text;not null"`
+	PermissionMode   string            `gorm:"column:permission_mode;type:varchar(32);not null;default:'auto'"`
+	MaxTurns         int               `gorm:"column:max_turns;not null;default:50"`
+	Title            map[string]string `gorm:"type:json;serializer:json"`
+	Description      map[string]string `gorm:"type:json;serializer:json"`
+	Icon             string            `gorm:"type:varchar(512)"`
+	IconName         string            `gorm:"column:icon_name;type:varchar(64)"`
+	IconColor        string            `gorm:"column:icon_color;type:varchar(32)"`
+	IconBgColor      string            `gorm:"column:icon_bg_color;type:varchar(64)"`
+	ProviderID       *uint64           `gorm:"column:provider_id;index"`
+	ModelID          string            `gorm:"column:model_id;type:varchar(64)"`
+	ModelSelectionID string            `gorm:"column:model_selection_id;type:varchar(128);default:''"` // 区分同 modelId 的多条 catalog 记录（如不同 contextWindow 的同款模型）
+	FieldOverrides   string            `gorm:"column:field_overrides;type:text"`                       // JSON，secret fields encrypted
+	Source           string            `gorm:"type:varchar(16);not null;default:'remote'"`
+	DesktopEnabled   bool              `gorm:"not null;default:false;index"`
+	MobileEnabled    bool              `gorm:"not null;default:false"`
+	GuestEnabled     bool              `gorm:"column:guest_enabled;not null;default:false"`
+	IsDefault        bool              `gorm:"column:is_default;default:false"`
+	Group            string            `gorm:"column:group_name;type:varchar(64);default:''"`
+	// BehaviorProfile is a deprecated compatibility snapshot. PersonalityPrompt
+	// and its template version are the authored source of truth.
+	BehaviorProfile            *BehaviorProfile `gorm:"column:behavior_profile;type:json;serializer:json"`
+	PersonalityTemplateName    string           `gorm:"column:personality_template_name;type:varchar(64);default:'';index"`
+	PersonalityTemplateVersion int              `gorm:"column:personality_template_version;not null;default:0"`
+	PersonalityPrompt          string           `gorm:"column:personality_prompt;type:text"`
+	MaxSessionQueries          *int             `gorm:"column:max_session_queries;type:int;default:null"`
+	DisallowedTools            []string         `gorm:"column:disallowed_tools;type:text;serializer:json"` // agent-local 工具名黑名单（issue #111），JSON 字符串数组；条目无需引用已挂载工具
+	RuntimePort                int              `gorm:"column:runtime_port;default:0"`
+	DeploymentStatus           string           `gorm:"column:deployment_status;type:varchar(32);default:''"`
+	DeployedAt                 *time.Time       `gorm:"column:deployed_at"`
+	RuntimeToken               string           `gorm:"column:runtime_token;type:text"` // AES-GCM encrypted, write-only from DB POV
+	CreatedAt                  time.Time        `gorm:"column:created_at"`
+	UpdatedAt                  time.Time        `gorm:"column:updated_at;index"`
+}
+
+func (AgentConfig) TableName() string {
+	return "agents"
+}
+
+// Client platforms used for agent visibility filtering.
+const (
+	PlatformDesktop = "desktop"
+	PlatformMobile  = "mobile"
+)
+
+type AgentSubagent struct {
+	AgentID    uint64      `gorm:"primaryKey"` // agent_id 是复合 PK 首列，单列索引冗余且曾跨表撞名（sqlite 索引名全局唯一）
+	SubagentID uint64      `gorm:"primaryKey;index:idx_subagent_id"`
+	Agent      AgentConfig `gorm:"foreignKey:AgentID;constraint:OnDelete:CASCADE" json:"-"`
+	Subagent   AgentConfig `gorm:"foreignKey:SubagentID;constraint:OnDelete:CASCADE" json:"-"`
+	CreatedAt  time.Time   `gorm:"column:created_at"`
+}
+
+func (AgentSubagent) TableName() string {
+	return "agent_subagents"
+}
+
+// Tool 来源（issue #88）：builtin = tenant_id=” 的共享只读预设行；
+// custom = 租户上传的单文件工具（.ts/.mts/.js/.mjs 制品）。
+const (
+	ToolSourceBuiltin = "builtin"
+	ToolSourceCustom  = "custom"
+)
+
+// 自定义工具制品状态（由文件字段派生，不持久化）：四字段完整为 ready，
+// 否则 missing（存量迁移行——列表可见但不可新增挂载/部署，补传后恢复）。
+const (
+	ToolArtifactReady   = "ready"
+	ToolArtifactMissing = "missing"
+)
+
+type Tool struct {
+	ID       uint64 `gorm:"primaryKey;autoIncrement"`
+	Name     string `gorm:"type:varchar(64);uniqueIndex:uk_tools_tenant_name,priority:2;not null"`
+	TenantID string `gorm:"type:varchar(64);not null;default:'';uniqueIndex:uk_tools_tenant_name,priority:1;index"`
+	// Title/Description/DescriptionEn 仅为控制台展示元数据（issue #88 + #93）：
+	// Runtime 使用的工具描述来自工具文件自身；descriptionEn 是控制台英文展示
+	// 描述（issue #93 补齐，对齐 CONTRIBUTING.md 核心实体双语约定）。
+	Title         string    `gorm:"type:varchar(128)"`
+	Description   string    `gorm:"type:text"`
+	DescriptionEn string    `gorm:"column:description_en;type:text" json:"descriptionEn"`
+	IsDefault     bool      `gorm:"column:is_default;not null;default:false"`
+	Source        string    `gorm:"type:varchar(16);not null;default:'custom'"`
+	FileName      string    `gorm:"column:file_name;type:varchar(255)"` // 上传原始文件名（展示/审计，扩展名来源）
+	FileURL       string    `gorm:"column:file_url;type:varchar(512)"`  // OSS object key（非完整 URL，同 skill.URL）
+	FileHash      string    `gorm:"column:file_hash;type:varchar(128)"` // sha256 hex
+	FileSize      int64     `gorm:"column:file_size"`
+	CreatedAt     time.Time `gorm:"column:created_at"`
+	UpdatedAt     time.Time `gorm:"column:updated_at;index"`
+}
+
+func (Tool) TableName() string {
+	return "tools"
+}
+
+// ArtifactStatus 派生制品状态。builtin 无制品语义，恒 ready。
+func (t *Tool) ArtifactStatus() string {
+	if t.Source != ToolSourceCustom {
+		return ToolArtifactReady
+	}
+	if t.FileName != "" && t.FileURL != "" && t.FileHash != "" && t.FileSize > 0 {
+		return ToolArtifactReady
+	}
+	return ToolArtifactMissing
+}
+
+func (t *Tool) IsBuiltin() bool { return t.Source == ToolSourceBuiltin }
+
+// PresetToolNames 是以共享模板行（tenant_id=”）写入 tools 表的全部预设
+// 工具名单，来源 = ToolService.SeedBuiltins（前三个：Skill/Task/MultiTask）
+// + ToolService.SeedIfEmpty（其余十五个：Bash 等六个基础工具 + WebFetch 等
+// 九个平台能力型工具，Memory/SessionSearch/MemorySearch 仍属 zerone 自建）。
+// pkg/database 的租户迁移按此名单把旧存量预设行归零为共享——seeding 与
+// 迁移两边必须同源引用本常量，新增预设工具时只改这里。
+var PresetToolNames = []string{
+	"Skill", "Task", "MultiTask",
+	"Bash", "Read", "Write", "Edit", "Glob", "Grep",
+	"WebFetch", "WebSearch", "AskUserQuestion",
+	"CronCreate", "CronDelete", "CronList",
+	"Config", "TodoWrite", "FindTool",
+}
+
+// AgentTool 是 Agent 与自定义工具的绑定关系。
+// 资源侧 FK 用 ON DELETE RESTRICT（#123 review P1）：同 AgentSkill——
+// 守卫与删除之间的并发写入窗口由约束原子关闭，杜绝级联静默摘除。
+type AgentTool struct {
+	AgentID   uint64      `gorm:"primaryKey"`
+	ToolID    uint64      `gorm:"primaryKey;index:idx_tool_id"`
+	Agent     AgentConfig `gorm:"foreignKey:AgentID;constraint:OnDelete:CASCADE" json:"-"`
+	Tool      Tool        `gorm:"foreignKey:ToolID;constraint:OnDelete:RESTRICT" json:"-"`
+	CreatedAt time.Time   `gorm:"column:created_at"`
+}
+
+func (AgentTool) TableName() string {
+	return "agent_tools"
+}
+
+// AgentSkill 是 Agent 与 Skill 的多对多绑定关系。
+// 资源侧 FK 用 ON DELETE RESTRICT（#123 review P1）：删除技能时若存在
+// （含并发刚写入的）绑定行，DB 直接拒绝删除——守卫检查与删除之间的
+// 并发写入窗口由约束原子关闭，杜绝级联静默摘除 Agent 能力。Agent 侧
+// 保持 CASCADE：删除 Agent 时绑定随行消亡。
+type AgentSkill struct {
+	AgentID   uint64      `gorm:"primaryKey"`
+	SkillID   uint64      `gorm:"primaryKey;index:idx_skill_id"`
+	Agent     AgentConfig `gorm:"foreignKey:AgentID;constraint:OnDelete:CASCADE" json:"-"`
+	Skill     skill.Skill `gorm:"foreignKey:SkillID;constraint:OnDelete:RESTRICT" json:"-"`
+	CreatedAt time.Time   `gorm:"column:created_at"`
+}
+
+func (AgentSkill) TableName() string {
+	return "agent_skills"
+}
+
+// DeploymentSnapshot 记录最近一次成功部署时下发到 runtime 的工件哈希集合
+// （issue #86）。每个 Agent 一行（upsert）；哈希来自部署请求的同源数据，
+// 供读取时的 pending 比对使用。仅含 custom&&ready Tool 与全部 Skill。
+type DeploymentSnapshot struct {
+	AgentID     uint64            `gorm:"primaryKey"`
+	Agent       AgentConfig       `gorm:"foreignKey:AgentID;constraint:OnDelete:CASCADE" json:"-"`
+	TenantID    string            `gorm:"type:varchar(64);not null;default:'';index"`
+	DeployedAt  time.Time         `gorm:"column:deployed_at;not null"`
+	ToolHashes  map[string]string `gorm:"type:json;serializer:json"`
+	SkillHashes map[string]string `gorm:"type:json;serializer:json"`
+	CreatedAt   time.Time         `gorm:"column:created_at"`
+	UpdatedAt   time.Time         `gorm:"column:updated_at"`
+}
+
+func (DeploymentSnapshot) TableName() string {
+	return "agent_deployment_snapshots"
+}

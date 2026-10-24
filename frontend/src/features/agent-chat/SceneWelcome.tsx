@@ -1,0 +1,142 @@
+import { Spin, Tooltip } from 'antd'
+import { useTranslation } from 'react-i18next'
+import { createStyles } from 'antd-style'
+import type { Scene } from '@/api/scenes'
+import { useAgentScenes } from '@/queries/useScenes'
+import { tokens as tk } from '@/styles/tokens'
+
+const useStyles = createStyles(({ css }) => ({
+  wrap: css`
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 40px 24px;
+    gap: 24px;
+  `,
+  loadingWrap: css`
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+  `,
+  hint: css`
+    color: ${tk.textMuted};
+    font-size: 14px;
+  `,
+  head: css`
+    color: ${tk.textSecondary};
+    font-size: 14px;
+    font-weight: 500;
+    text-align: center;
+  `,
+  grid: css`
+    width: 100%;
+    max-width: 720px;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 12px;
+  `,
+  card: css`
+    padding: 16px;
+    border: 1px solid ${tk.inkLighter};
+    border-radius: ${tk.radius}px;
+    background: ${tk.surface};
+    cursor: pointer;
+    transition: all 0.15s ease;
+    text-align: left;
+    &:hover {
+      border-color: color-mix(in srgb, var(--foreground) 30%, transparent);
+      box-shadow: ${tk.elevation1};
+      transform: translateY(-1px);
+    }
+    &:active {
+      transform: scale(0.98);
+    }
+  `,
+  cardDisabled: css`
+    opacity: 0.5;
+    pointer-events: none;
+  `,
+  cardTitle: css`
+    font-weight: 600;
+    font-size: 14px;
+    color: ${tk.text};
+    margin-bottom: 6px;
+  `,
+  cardPreview: css`
+    font-size: 12px;
+    color: ${tk.textTertiary};
+    line-height: 1.5;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  `,
+  footerHint: css`
+    color: ${tk.textMuted};
+    font-size: 12px;
+  `,
+  promptTip: css`
+    // Long scene prompts would otherwise fill the whole screen; cap the
+    // tooltip height and scroll instead. pre-wrap keeps line breaks readable.
+    max-height: 40vh;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+  `
+}))
+
+interface SceneWelcomeProps {
+  agentName: string
+  onPick: (scene: Scene) => void
+  disabled?: boolean
+}
+
+export default function SceneWelcome({ agentName, onPick, disabled }: SceneWelcomeProps) {
+  const { t } = useTranslation()
+  const { styles } = useStyles()
+  const { data: scenes, isLoading } = useAgentScenes(agentName)
+
+  if (isLoading) {
+    return (
+      <div className={styles.loadingWrap}>
+        <Spin />
+      </div>
+    )
+  }
+
+  if (!scenes || scenes.length === 0) {
+    return (
+      <div className={styles.wrap}>
+        <div className={styles.hint}>{t('agentChat.sceneHint')}</div>
+      </div>
+    )
+  }
+
+  return (
+    <div className={styles.wrap}>
+      <div className={styles.head}>{t('agentChat.sceneTry')}</div>
+      <div className={styles.grid}>
+        {scenes.map((scene) => (
+          <Tooltip
+            key={scene.id}
+            title={<div className={styles.promptTip}>{scene.prompt}</div>}
+            placement="top"
+          >
+            <button
+              type="button"
+              className={`${styles.card}${disabled ? ` ${styles.cardDisabled}` : ''}`}
+              onClick={() => { if (!disabled) onPick(scene) }}
+            >
+              <div className={styles.cardTitle}>{scene.title}</div>
+              <div className={styles.cardPreview}>{scene.prompt}</div>
+            </button>
+          </Tooltip>
+        ))}
+      </div>
+      <div className={styles.footerHint}>{t('agentChat.sceneFooter')}</div>
+    </div>
+  )
+}

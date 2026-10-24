@@ -1,0 +1,543 @@
+package services
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"strconv"
+	"sync"
+	"time"
+
+	"control-panel/internal/domain/agent"
+	"control-panel/internal/domain/chat"
+	"control-panel/internal/infrastructure/runtime"
+
+	"github.com/google/uuid"
+	"gorm.io/gorm"
+)
+
+// chatRepositoryForAgent is the subset of ChatRepository used by AgentChatService.
+type chatRepositoryForAgent interface {
+	ListSessionsByAgentAndUser(tenantID, agentID, userID, source string, page, pageSize int) ([]*chat.Session, int64, error)
+	GetSessionForUser(tenantID, sessionID, userID string) (*chat.Session, error)
+	CreateSession(tenantID string, sess *chat.Session) error
+	CreateMessage(tenantID string, msg *chat.Message) error
+	DeleteSession(tenantID, sessionID string) error
+	ListMessages(tenantID, sessionID string, page, pageSize int) ([]*chat.Message, int64, error)
+	UpdateSessionRuntimeSessionID(tenantID, sessionID, runtimeSessionID string) error
+	UpdateSessionTitle(tenantID, sessionID, title string) error
+	CreateUploadRecords(tenantID string, records []*chat.UploadRecord) error
+	GetUploadRecord(tenantID, sessionID, id string) (*chat.UploadRecord, error)
+	HasUploadRecordPath(tenantID, sessionID, path, containerID string) (bool, error)
+	DeleteMessageByID(tenantID, sessionID, messageID string) error
+}
+
+// agentRepoForChat is the subset of AgentRepository used by AgentChatService.
+type agentRepoForChat interface {
+	GetByName(tenantID, name string) (*agent.AgentConfig, error)
+}
+
+type providerKeyRepoForChat interface {
+	GetProviderKey(tenantID string, id uint64) (string, error)
+}
+
+// AgentChatService handles agent chat sessions and message persistence.
+// Streaming itself is delegated to the HTTP handler, which calls
+// svc.RuntimeClient().StreamRun(...) and forwards bytes via flusher.Flush().
+// Persistence of the user message before streaming and the assistant message
+// after streaming completes is handled here.
+type AgentChatService struct {
+	chatRepo      chatRepositoryForAgent
+	agentRepo     agentRepoForChat
+	deployerSvc   *AgentDeployerService
+	runtimeClient *runtime.Client
+	publicHost    string
+	runtimeKey    string
+	upstreamHost  string // cfg.Deployer.UpstreamHost; "" = fail closed (no-Kong upstream)
+
+	// attachment capability probe cache（15s TTL，issue #94）
+	probeMu    sync.Mutex
+	probeCache map[string]attachmentProbe
+}
+
+// NewAgentChatService constructs an AgentChatService.
+func NewAgentChatService(
+	chatRepo chatRepositoryForAgent,
+	agentRepo agentRepoForChat,
+	deployerSvc *AgentDeployerService,
+	rtClient *runtime.Client,
+	publicHost, runtimeKey, upstreamHost string,
+) *AgentChatService {
+	return &AgentChatService{
+		chatRepo:      chatRepo,
+		agentRepo:     agentRepo,
+		deployerSvc:   deployerSvc,
+		runtimeClient: rtClient,
+		publicHost:    publicHost,
+		runtimeKey:    runtimeKey,
+		upstreamHost:  upstreamHost,
+	}
+}
+
+// AgentGuestVisible reports whether the named agent is visible to guests.
+// Not-found agents report (false, nil) so the chat handlers render a neutral
+// 404 identical to a missing agent (anti-enumeration, spec 7). Semantics are
+// identical to AgentService.AgentGuestVisible (the canonical implementation
+// for the agent detail endpoint); this delegation exists because the chat
+// handlers hold *AgentChatService, whose agentRepoForChat subset already
+// carries GetByName.
+func (s *AgentChatService) AgentGuestVisible(tenantID, name string) (bool, error) {
+	cfg, err := s.agentRepo.GetByName(tenantID, name)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return false, nil
+		}
+		return false, fmt.Errorf("get agent %s failed: %w", name, err)
+	}
+	return cfg.GuestEnabled, nil
+}
+
+// AgentUsageIdentity resolves the stable database identity and configured
+// model/provider used as fallbacks when an older runtime omits attribution
+// fields from its terminal SSE result.
+func (s *AgentChatService) AgentUsageIdentity(tenantID, name string) (uint64, string, string, error) {
+	cfg, err := s.agentRepo.GetByName(tenantID, name)
+	if err != nil {
+		return 0, "", "", err
+	}
+	provider := ""
+	if cfg.ProviderID != nil {
+		resolver, ok := s.agentRepo.(providerKeyRepoForChat)
+		if ok {
+			provider, err = resolver.GetProviderKey(tenantID, *cfg.ProviderID)
+		}
+		if !ok || err != nil {
+			// Retain a stable, non-empty attribution even if a legacy provider row
+			// was removed after the Agent was configured.
+			provider = "id:" + strconv.FormatUint(*cfg.ProviderID, 10)
+		}
+	}
+	return cfg.ID, cfg.ModelID, provider, nil
+}
+
+// RuntimeClient exposes the runtime client for the handler to stream from.
+func (s *AgentChatService) RuntimeClient() *runtime.Client { return s.runtimeClient }
+
+// RuntimeKey returns the runtime API key (used by the handler when calling StreamRun).
+func (s *AgentChatService) RuntimeKey() string { return s.runtimeKey }
+
+// PublicHost returns the configured public host for runtime URLs.
+func (s *AgentChatService) PublicHost() string { return s.publicHost }
+
+// Source constant identifying sessions created from the Agent Chatbox page.
+const SourceAgentChatPage = "agent_chat_page"
+
+// attachmentProbeTTL bounds capability probe caching.
+const attachmentProbeTTL = 15 * time.Second
+
+// ListSessions returns sessions for the given (agent, user) pair.
+// source filters the session origin (e.g. "agent_chat_page"); pass empty to list all.
+func (s *AgentChatService) ListSessions(tenantID, userID, agentName, source string, page, pageSize int) ([]*chat.Session, int64, error) {
+	return s.chatRepo.ListSessionsByAgentAndUser(tenantID, agentName, userID, source, page, pageSize)
+}
+
+// CreateSession creates a new empty session for the given user + agent.
+// Agent config (model, system_prompt, provider_id, permission_mode) is copied in.
+// userName and displayName are taken from the JWT context so the session header
+// can show a human-readable creator name instead of a truncated user id.
+func (s *AgentChatService) CreateSession(tenantID, userID, agentName, title, userName, displayName string) (*chat.Session, error) {
+	cfg, err := s.agentRepo.GetByName(tenantID, agentName)
+	if err != nil {
+		return nil, fmt.Errorf("agent not found: %w", err)
+	}
+
+	now := time.Now().UTC()
+	sess := &chat.Session{
+		UserID:            userID,
+		ID:                uuid.NewString(),
+		Title:             title,
+		UserName:          userName,
+		DisplayName:       displayName,
+		CreatedAt:         now,
+		UpdatedAt:         now,
+		Model:             cfg.ModelID,
+		SystemPrompt:      cfg.SystemPrompt,
+		Status:            "active",
+		Mode:              "agent_chat",
+		ProviderID:        providerIDString(cfg.ProviderID),
+		AgentID:           agentName,
+		PermissionProfile: cfg.PermissionMode,
+		Source:            SourceAgentChatPage,
+	}
+	if err := s.chatRepo.CreateSession(tenantID, sess); err != nil {
+		return nil, fmt.Errorf("create session: %w", err)
+	}
+	return sess, nil
+}
+
+// providerIDString safely converts *uint64 to string for the Session.ProviderID field.
+func providerIDString(p *uint64) string {
+	if p == nil {
+		return ""
+	}
+	return fmt.Sprintf("%d", *p)
+}
+
+// contentPart is the canonical text content shape persisted in Message.Content.
+// A struct (not a map) is used so json.Marshal emits fields in a stable order
+// matching the canonical form `[{"type":"text","text":"..."}]`.
+type contentPart struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+// filePart is the canonical attachment shape persisted in Message.Content.
+// Ordered BEFORE the optional text part (issue #94).
+type filePart struct {
+	Type string `json:"type"`
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Mime string `json:"mime"`
+	Size int64  `json:"size"`
+	Path string `json:"path"`
+}
+
+// GetMessages returns messages for a session owned by userID.
+func (s *AgentChatService) GetMessages(tenantID, userID, agentName, sessionID string, page, pageSize int) ([]*chat.Message, int64, error) {
+	sess, err := s.chatRepo.GetSessionForUser(tenantID, sessionID, userID)
+	if err != nil {
+		return nil, 0, fmt.Errorf("session not found: %w", err)
+	}
+	// 绑定校验（PR #151 review P1）：URL :name 必须与会话真实归属 Agent 一致，
+	// 不一致按 not-found 同形处理——杜绝经开放 Agent 的 URL 越权读写自己名下
+	// 其他 Agent 的会话（guest 场景即绕过可见性过滤）。与 SendMessage /
+	// Uploads / AttachmentContent 的既有 handler 级防线同语义，此处下沉
+	// service 层并在同一次查询内完成。
+	if sess.AgentID != agentName {
+		return nil, 0, fmt.Errorf("session not found: %w", gorm.ErrRecordNotFound)
+	}
+	return s.chatRepo.ListMessages(tenantID, sessionID, page, pageSize)
+}
+
+// DeleteSession deletes a session owned by userID, including its upload
+// records (attachment descriptors are session-scoped authorization anchors —
+// they must not outlive the session). The records are removed inside the
+// repository's DeleteSession transaction (issue #94 review R2 F3), so a
+// partial failure can never leave records behind for a deleted session.
+func (s *AgentChatService) DeleteSession(tenantID, userID, agentName, sessionID string) error {
+	sess, err := s.chatRepo.GetSessionForUser(tenantID, sessionID, userID)
+	if err != nil {
+		return fmt.Errorf("session not found: %w", err)
+	}
+	// 绑定校验同 GetMessages（PR #151 review P1）：跨 Agent URL 删除自己名下
+	// 其他 Agent 的会话 → not-found 同形，会话不被删除。
+	if sess.AgentID != agentName {
+		return fmt.Errorf("session not found: %w", gorm.ErrRecordNotFound)
+	}
+	return s.chatRepo.DeleteSession(tenantID, sessionID)
+}
+
+// SaveUserMessage persists a user message in the given session. content and
+// attachments are wrapped into the canonical JSON array format: file parts
+// first, then the optional text part (empty content adds no text part).
+func (s *AgentChatService) SaveUserMessage(tenantID, userID, sessionID, content string, attachments []AttachmentDesc) (*chat.Message, error) {
+	if _, err := s.chatRepo.GetSessionForUser(tenantID, sessionID, userID); err != nil {
+		return nil, fmt.Errorf("session not found: %w", err)
+	}
+
+	parts := make([]interface{}, 0, len(attachments)+1)
+	for _, a := range attachments {
+		parts = append(parts, filePart{
+			Type: "file", ID: a.ID, Name: a.Name, Mime: a.Mime, Size: a.Size, Path: a.Path,
+		})
+	}
+	if content != "" {
+		parts = append(parts, contentPart{Type: "text", Text: content})
+	}
+	wrapped, _ := json.Marshal(parts)
+
+	msg := &chat.Message{
+		UserID:    userID,
+		ID:        uuid.NewString(),
+		SessionID: sessionID,
+		Role:      "user",
+		Content:   string(wrapped),
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := s.chatRepo.CreateMessage(tenantID, msg); err != nil {
+		return nil, fmt.Errorf("create message: %w", err)
+	}
+	return msg, nil
+}
+
+// SaveAssistantMessage persists an assistant message with pre-aggregated JSON
+// content and the AIGC label extracted from the stream ("" when unlabeled).
+func (s *AgentChatService) SaveAssistantMessage(tenantID, userID, sessionID, content, aigc string) (*chat.Message, error) {
+	return s.saveMessage(tenantID, userID, sessionID, "assistant", content, aigc)
+}
+
+// SaveSystemMessage persists a system message (e.g. runtime error) into the session.
+func (s *AgentChatService) SaveSystemMessage(tenantID, userID, sessionID, content string) (*chat.Message, error) {
+	return s.saveMessage(tenantID, userID, sessionID, "system", content, "")
+}
+
+func (s *AgentChatService) saveMessage(tenantID, userID, sessionID, role, content, aigc string) (*chat.Message, error) {
+	if _, err := s.chatRepo.GetSessionForUser(tenantID, sessionID, userID); err != nil {
+		return nil, fmt.Errorf("session not found: %w", err)
+	}
+
+	msg := &chat.Message{
+		UserID:    userID,
+		ID:        uuid.NewString(),
+		SessionID: sessionID,
+		Role:      role,
+		Content:   content,
+		Aigc:      aigc,
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := s.chatRepo.CreateMessage(tenantID, msg); err != nil {
+		return nil, fmt.Errorf("create message: %w", err)
+	}
+	return msg, nil
+}
+
+// GetSession returns a session owned by userID.
+func (s *AgentChatService) GetSession(tenantID, userID, sessionID string) (*chat.Session, error) {
+	return s.chatRepo.GetSessionForUser(tenantID, sessionID, userID)
+}
+
+// BindRuntimeSessionID stores the runtime SDK session id returned by the first
+// run so subsequent messages in the same control-panel session can resume it.
+func (s *AgentChatService) BindRuntimeSessionID(tenantID, sessionID, runtimeSessionID string) error {
+	return s.chatRepo.UpdateSessionRuntimeSessionID(tenantID, sessionID, runtimeSessionID)
+}
+
+// AutoTitleSession sets the session title from the first user message if the
+// session has no title yet. Long titles are truncated to 50 characters with "...".
+func (s *AgentChatService) AutoTitleSession(tenantID, sessionID, firstUserContent string) error {
+	if firstUserContent == "" {
+		return nil
+	}
+	title := firstUserContent
+	if len([]rune(title)) > 50 {
+		title = string([]rune(title)[:50]) + "..."
+	}
+	return s.chatRepo.UpdateSessionTitle(tenantID, sessionID, title)
+}
+
+// noKongUpstream builds the internal upstream base URL for the no-Kong mode:
+// AGENT_RUNTIME_UPSTREAM_HOST + published port. Empty upstream host fails
+// closed — DB may retain running state from before a config change.
+func (s *AgentChatService) noKongUpstream(port int) (string, error) {
+	if s.upstreamHost == "" {
+		return "", fmt.Errorf("internal runtime upstream host is not configured")
+	}
+	return "http://" + net.JoinHostPort(s.upstreamHost, strconv.Itoa(port)), nil
+}
+
+// kongEnabledForChat reports whether the Kong gateway chain is active. A nil
+// deployerSvc is treated as no-Kong (lean toward the internal upstream).
+func (s *AgentChatService) kongEnabledForChat() bool {
+	return s.deployerSvc != nil && s.deployerSvc.kongEnabled()
+}
+
+// resolveBaseURL 按网关模式严格分支选取拨号目标（issue #77 验收 #10：Kong
+// 链路零变化）：
+//
+//	① Kong 启用 → 信任 toDTO 已填充的网关 RuntimeURL；空 URL 的预注册边缘
+//	   （Kong enabled 但路由尚未注册完成）保持本 PR 合入前的 main 行为：
+//	   http://{publicHost}:{hostPort} 公网地址，绝不回落到 deployer 内网回源
+//	   （构造方式改 net.JoinHostPort，IPv6 安全；仅构造方式变更，语义不动）。
+//	② 无 Kong → 公开地址（hairpin 绝对 URL 或相对路径）永远不是内部拨号
+//	   目标，一律走 deployer hostname 内网回源（issue #77 验收 #8）。
+func (s *AgentChatService) resolveBaseURL(kongEnabled bool, runtimeURL string, hostPort int) (string, error) {
+	if !kongEnabled {
+		return s.noKongUpstream(hostPort)
+	}
+	if runtimeURL == "" {
+		return "http://" + net.JoinHostPort(s.publicHost, strconv.Itoa(hostPort)), nil
+	}
+	return runtimeURL, nil
+}
+
+// ResolveRuntime 按模式分支定位 runtime 目标（issue #77），返回
+// (baseURL, APIKey, ContainerID, error)。前置门：deployer 状态必须
+// running 且 HostPort > 0，否则 fail-closed 返回 error。
+//
+// baseURL 按网关模式分支：
+//
+//	① Kong 模式（deployerSvc 非 nil 且 kongEnabled）→ 信任 toDTO 已填充的
+//	   网关 RuntimeURL（kong routing URL，如 "https://agents.example.com/
+//	   zerone/pharmaceutical"）；RuntimeURL 空的预注册边缘（Kong 已启用但
+//	   路由尚未注册完成）→ 回退 http://{publicHost}:{hostPort} 公网地址，
+//	   绝不回落 deployer 内网回源（issue #77 验收 #10：Kong 链路零变化）。
+//	② 无 Kong（kong 未启用；deployerSvc 非 nil 但 kongEnabled() 为 false——
+//	   首行 GetStatus 已先解引用）→ 公开 RuntimeURL（hairpin
+//	   绝对 URL 或相对路径）永远不是内部拨号目标，一律走
+//	   http://{upstreamHost}:{hostPort} deployer 网络内网回源（issue #77
+//	   验收 #8）。runtime client 在 baseURL 后追加 /v1/agents/{name}/runs，
+//	   Kong 的 StripPath 剥掉 agent 名前缀后转发规范 runtime API 路径。
+//
+// containerID 是部署代际锚点（issue #94 review R3）：Docker 每次重建
+// （redeploy）分配新 id、原地重启保持不变——与 .zerone-uploads 磁盘
+// 生命周期一致。调用方上传时绑定、发送/下载时复检，存量代际记录
+// fail-closed，零时间容忍；空 containerID（deployer 未报告）须按
+// 「代际未知」处理。
+func (s *AgentChatService) ResolveRuntime(tenantID, agentName string) (string, string, string, error) {
+	status, err := s.deployerSvc.GetStatus(tenantID, agentName)
+	if err != nil {
+		return "", "", "", fmt.Errorf("get deployment status: %w", err)
+	}
+	if status.Status != "running" {
+		return "", "", "", fmt.Errorf("agent not running (status=%s)", status.Status)
+	}
+	if status.HostPort == 0 {
+		return "", "", "", fmt.Errorf("agent running but no host port")
+	}
+	baseURL, err := s.resolveBaseURL(s.kongEnabledForChat(), status.RuntimeURL, status.HostPort)
+	if err != nil {
+		return "", "", "", err
+	}
+	return baseURL, status.APIKey, status.ContainerID, nil
+}
+
+// attachmentProbe caches one capability probe result.
+type attachmentProbe struct {
+	ok bool
+	at time.Time
+}
+
+// ProbeAttachmentSupport probes the runtime /health endpoint (no auth) on an
+// already-resolved base URL. The gate is the capability declaration, not the
+// version string: attachments require the runtime to advertise
+// attachmentExpectedGeneration (runtime >= 2.7.0, the release that shipped
+// the X-Expected-Container-Id atomic generation check — runtime PR #62 /
+// issue #61). A runtime without a capabilities field (all pre-2.7.0) parses
+// as false. Generation binding itself is done via the deployer-reported
+// container id from ResolveRuntime, not via /health (issue #94 review R3).
+func (s *AgentChatService) ProbeAttachmentSupport(ctx context.Context, baseURL string) (bool, error) {
+	info, err := s.runtimeClient.Health(ctx, baseURL)
+	if err != nil {
+		return false, err
+	}
+	return info.Capabilities.AttachmentExpectedGeneration, nil
+}
+
+// AttachmentsSupportedAt is a thin wrapper over ProbeAttachmentSupport for
+// callers that only need the capability verdict.
+func (s *AgentChatService) AttachmentsSupportedAt(ctx context.Context, baseURL string) bool {
+	supported, err := s.ProbeAttachmentSupport(ctx, baseURL)
+	return err == nil && supported
+}
+
+// AttachmentsAvailable reports (15s TTL cache) whether the agent's runtime
+// supports attachments. Probe failures return false — text chat is never
+// blocked by this. The gate is conjunctive (runtime #61 Hub 跟进契约):
+// runtime capability declaration && non-empty deployer containerId — either
+// missing closes the entrance (no upload, no attachment-bearing send).
+func (s *AgentChatService) AttachmentsAvailable(ctx context.Context, tenantID, agentName string) bool {
+	key := tenantID + "\x00" + agentName
+	s.probeMu.Lock()
+	if hit, ok := s.probeCache[key]; ok && time.Since(hit.at) < attachmentProbeTTL {
+		s.probeMu.Unlock()
+		return hit.ok
+	}
+	s.probeMu.Unlock()
+
+	ok := false
+	// runtime #61 Hub 跟进契约：capability && deployer containerId 非空，二者
+	// 缺一即关闭（不探测）。containerId 在此处门控——deployer 未报告容器 id
+	//（空代次）时上传记录的代次绑定无从谈起，capability 探测通过也不能开入口。
+	if baseURL, _, containerID, err := s.ResolveRuntime(tenantID, agentName); err == nil && containerID != "" {
+		ok = s.AttachmentsSupportedAt(ctx, baseURL)
+	}
+	s.probeMu.Lock()
+	if s.probeCache == nil {
+		s.probeCache = make(map[string]attachmentProbe)
+	}
+	s.probeCache[key] = attachmentProbe{ok: ok, at: time.Now()}
+	s.probeMu.Unlock()
+	return ok
+}
+
+// SessionHasAttachment reports whether path belongs to a server-side upload
+// record of the session created in the CURRENT runtime container generation
+// (containerID from ResolveRuntime — issue #94 review F1/R3: records are
+// written only by the hub at upload time — the unforgeable authorization
+// anchor for the user-facing content proxy; message file parts are
+// display-only). Runtime /v1/files/content can read the whole cwd, so this
+// cross-check must only ever admit paths the runtime handed out to THIS
+// session in THIS container generation. The match is an exact container-id
+// equality — no time tolerance.
+func (s *AgentChatService) SessionHasAttachment(tenantID, userID, sessionID, path, containerID string) (bool, error) {
+	if _, err := s.chatRepo.GetSessionForUser(tenantID, sessionID, userID); err != nil {
+		return false, fmt.Errorf("session not found: %w", err)
+	}
+	if containerID == "" {
+		// Authorization path: fail closed when the generation is unknown
+		// (deployer did not report a container id) rather than treating
+		// every record as current.
+		return false, nil
+	}
+	return s.chatRepo.HasUploadRecordPath(tenantID, sessionID, path, containerID)
+}
+
+// SaveUploadRecords persists the runtime-issued attachment descriptors after
+// a successful upload, binding them to (tenant, session, user) AND the
+// immutable container generation the upload was served by (containerID is
+// captured from ResolveRuntime BEFORE the upload request is issued, so it is
+// naturally the generation that actually processed the upload — an upload
+// interrupted by a recreate leaves no record, and a recreate right after a
+// successful upload marks the record stale). These records — not the
+// client-supplied message descriptors — later authorize both the content
+// proxy and SendMessage attachment acceptance. All descriptors of one
+// upload persist atomically (issue #94 review R2 F4): the runtime has
+// already issued the ids/files, so a partial persist would leave files no
+// record authorizes.
+func (s *AgentChatService) SaveUploadRecords(tenantID, userID, sessionID, containerID string, files []AttachmentDesc) error {
+	if _, err := s.chatRepo.GetSessionForUser(tenantID, sessionID, userID); err != nil {
+		return fmt.Errorf("session not found: %w", err)
+	}
+	records := make([]*chat.UploadRecord, 0, len(files))
+	for _, f := range files {
+		records = append(records, &chat.UploadRecord{
+			ID:          f.ID,
+			SessionID:   sessionID,
+			UserID:      userID,
+			Name:        f.Name,
+			Mime:        f.Mime,
+			Size:        f.Size,
+			Path:        f.Path,
+			ContainerID: containerID,
+			CreatedAt:   time.Now().UTC(),
+		})
+	}
+	if err := s.chatRepo.CreateUploadRecords(tenantID, records); err != nil {
+		return fmt.Errorf("create upload records: %w", err)
+	}
+	return nil
+}
+
+// GetUploadRecord returns the server-side upload record for id, scoped to the
+// session owned by userID. Callers compare the record against a client-
+// supplied descriptor; a missing record means the descriptor was never issued
+// by an upload in this session (forged) and must be rejected.
+func (s *AgentChatService) GetUploadRecord(tenantID, userID, sessionID, id string) (*chat.UploadRecord, error) {
+	if _, err := s.chatRepo.GetSessionForUser(tenantID, sessionID, userID); err != nil {
+		return nil, fmt.Errorf("session not found: %w", err)
+	}
+	return s.chatRepo.GetUploadRecord(tenantID, sessionID, id)
+}
+
+// DeleteMessageByID removes one message from a session owned by userID. Used
+// to roll back the optimistic user-message persist when the runtime rejects
+// the run pre-flight (e.g. attachment_missing after a container rebuild) so a
+// retry does not duplicate the user turn.
+func (s *AgentChatService) DeleteMessageByID(tenantID, userID, sessionID, messageID string) error {
+	if _, err := s.chatRepo.GetSessionForUser(tenantID, sessionID, userID); err != nil {
+		return fmt.Errorf("session not found: %w", err)
+	}
+	return s.chatRepo.DeleteMessageByID(tenantID, sessionID, messageID)
+}

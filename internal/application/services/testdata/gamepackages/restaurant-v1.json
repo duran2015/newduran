@@ -1,0 +1,73 @@
+{
+  "schemaVersion": "game.zerone.io/v1",
+  "package": {
+    "key": "io.example.restaurant",
+    "version": "1.0.0",
+    "displayName": "餐厅经营测试包",
+    "description": "验证库存、现金、采购、等待、供应中断和停业等领域元素仅由游戏包声明。"
+  },
+  "registry": {
+    "metrics": [
+      { "id": "inventory", "name": "食材库存", "type": "integer", "initial": 5, "minimum": 0, "maximum": 100 },
+      { "id": "cash", "name": "可用现金", "type": "integer", "initial": 100, "minimum": 0, "maximum": 10000 },
+      { "id": "operating", "name": "营业状态", "type": "boolean", "initial": true }
+    ],
+    "actions": [
+      {
+        "id": "purchase",
+        "name": "采购食材",
+        "effects": [
+          { "operation": "decrement", "target": "cash", "value": 20 },
+          { "operation": "increment", "target": "inventory", "value": 5 }
+        ],
+        "emits": "restaurant.purchased"
+      },
+      {
+        "id": "wait",
+        "name": "等待一天",
+        "effects": [
+          { "operation": "decrement", "target": "inventory", "value": 1 }
+        ],
+        "emits": "restaurant.day_waited"
+      },
+      {
+        "id": "supply_interruption",
+        "name": "模拟供应中断",
+        "effects": [
+          { "operation": "decrement", "target": "inventory", "value": 4 }
+        ],
+        "emits": "restaurant.supply_interrupted"
+      },
+      {
+        "id": "close",
+        "name": "停止营业",
+        "effects": [
+          { "operation": "set", "target": "operating", "value": false }
+        ],
+        "emits": "restaurant.closed"
+      }
+    ],
+    "events": [
+      { "id": "restaurant.purchased", "name": "采购完成" },
+      { "id": "restaurant.day_waited", "name": "一天结束" },
+      { "id": "restaurant.supply_interrupted", "name": "供应中断" },
+      { "id": "restaurant.closed", "name": "餐厅停业" }
+    ],
+    "endings": [
+      { "id": "restaurant_closed", "name": "餐厅停业", "description": "M0仅登记结局元数据；正式条件判断在M1实现。" }
+    ]
+  },
+  "acceptanceScenarios": [
+    {
+      "id": "restaurant_crisis",
+      "name": "采购后遭遇供应中断",
+      "description": "验证一个动作产生多个效果、库存消耗和停业状态。",
+      "commands": [
+        { "actionId": "purchase" },
+        { "actionId": "wait" },
+        { "actionId": "supply_interruption" },
+        { "actionId": "close" }
+      ]
+    }
+  ]
+}

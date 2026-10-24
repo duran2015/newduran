@@ -1,0 +1,24 @@
+bin/
+/server
+*.exe
+*.test
+*.out
+coverage.out
+vendor/
+env
+.vscode/
+dist/
+__debug_bin*
+node_modules/
+frontend/.vite/
+.worktrees/
+.zerone/
+.zerone-uploads/
+.superpowers/
+.playwright-cli/
+.codegraph/
+docs/superpowers/
+quickstart/.env
+
+# Local SQLite dev database (scripts/dev-local.sh)
+agent_hub.db*

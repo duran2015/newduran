@@ -1,0 +1,311 @@
+package services
+
+import (
+	"testing"
+
+	"control-panel/internal/domain/agent"
+	"control-panel/internal/domain/chat"
+)
+
+// mockChatRepo is a minimal in-memory chat repository for service-level tests.
+type mockChatRepo struct {
+	sessions map[string]*chat.Session
+	messages map[string]*chat.Message
+	uploads  map[string]*chat.UploadRecord
+	listSess []*chat.Session
+}
+
+func newMockChatRepo() *mockChatRepo {
+	return &mockChatRepo{
+		sessions: make(map[string]*chat.Session),
+		messages: make(map[string]*chat.Message),
+		uploads:  make(map[string]*chat.UploadRecord),
+	}
+}
+
+func (m *mockChatRepo) ListSessionsByAgentAndUser(tenantID, agentID, userID, source string, page, pageSize int) ([]*chat.Session, int64, error) {
+	var out []*chat.Session
+	for _, s := range m.listSess {
+		if s.TenantID == tenantID && s.AgentID == agentID && s.UserID == userID {
+			if source == "" || s.Source == source {
+				out = append(out, s)
+			}
+		}
+	}
+	return out, int64(len(out)), nil
+}
+
+func (m *mockChatRepo) GetSessionForUser(tenantID, sessionID, userID string) (*chat.Session, error) {
+	s, ok := m.sessions[sessionID]
+	if !ok || s.TenantID != tenantID || s.UserID != userID {
+		return nil, errNotFound
+	}
+	return s, nil
+}
+
+func (m *mockChatRepo) CreateSession(tenantID string, sess *chat.Session) error {
+	sess.TenantID = tenantID
+	m.sessions[sess.ID] = sess
+	m.listSess = append(m.listSess, sess)
+	return nil
+}
+
+func (m *mockChatRepo) CreateMessage(tenantID string, msg *chat.Message) error {
+	msg.TenantID = tenantID
+	m.messages[msg.ID] = msg
+	return nil
+}
+
+func (m *mockChatRepo) DeleteSession(tenantID, sessionID string) error {
+	if s, ok := m.sessions[sessionID]; ok && s.TenantID == tenantID {
+		delete(m.sessions, sessionID)
+	}
+	// Mirrors the repository transaction (issue #94 review R2 F3): messages
+	// and upload records die with the session.
+	for id, msg := range m.messages {
+		if msg.TenantID == tenantID && msg.SessionID == sessionID {
+			delete(m.messages, id)
+		}
+	}
+	for id, r := range m.uploads {
+		if r.TenantID == tenantID && r.SessionID == sessionID {
+			delete(m.uploads, id)
+		}
+	}
+	return nil
+}
+
+func (m *mockChatRepo) ListMessages(tenantID, sessionID string, page, pageSize int) ([]*chat.Message, int64, error) {
+	var out []*chat.Message
+	for _, msg := range m.messages {
+		if msg.TenantID == tenantID && msg.SessionID == sessionID {
+			out = append(out, msg)
+		}
+	}
+	return out, int64(len(out)), nil
+}
+
+func (m *mockChatRepo) UpdateSessionRuntimeSessionID(tenantID, sessionID, runtimeSessionID string) error {
+	if s, ok := m.sessions[sessionID]; ok && s.TenantID == tenantID {
+		s.RuntimeSessionID = runtimeSessionID
+	}
+	return nil
+}
+
+func (m *mockChatRepo) UpdateSessionTitle(tenantID, sessionID, title string) error {
+	if s, ok := m.sessions[sessionID]; ok && s.TenantID == tenantID {
+		if s.Title == "" {
+			s.Title = title
+		}
+	}
+	return nil
+}
+
+func (m *mockChatRepo) CreateUploadRecords(tenantID string, records []*chat.UploadRecord) error {
+	for _, r := range records {
+		r.TenantID = tenantID
+		m.uploads[r.ID] = r
+	}
+	return nil
+}
+
+func (m *mockChatRepo) GetUploadRecord(tenantID, sessionID, id string) (*chat.UploadRecord, error) {
+	r, ok := m.uploads[id]
+	if !ok || r.TenantID != tenantID || r.SessionID != sessionID {
+		return nil, errNotFound
+	}
+	return r, nil
+}
+
+func (m *mockChatRepo) HasUploadRecordPath(tenantID, sessionID, path, containerID string) (bool, error) {
+	for _, r := range m.uploads {
+		if r.TenantID == tenantID && r.SessionID == sessionID && r.Path == path && r.ContainerID == containerID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (m *mockChatRepo) DeleteMessageByID(tenantID, sessionID, messageID string) error {
+	if msg, ok := m.messages[messageID]; ok && msg.TenantID == tenantID && msg.SessionID == sessionID {
+		delete(m.messages, messageID)
+	}
+	return nil
+}
+
+// errNotFound mirrors gorm.ErrRecordNotFound for test simplicity.
+var errNotFound = &notFoundErr{}
+
+type notFoundErr struct{}
+
+func (e *notFoundErr) Error() string { return "record not found" }
+
+// mockAgentRepoForChat returns a hardcoded agent config for service tests.
+type mockAgentRepoForChat struct {
+	cfg *agent.AgentConfig
+}
+
+func (m *mockAgentRepoForChat) GetByName(tenantID, name string) (*agent.AgentConfig, error) {
+	return m.cfg, nil
+}
+
+func TestCreateSession_PopulatesFromAgent(t *testing.T) {
+	repo := newMockChatRepo()
+	agentRepo := &mockAgentRepoForChat{cfg: &agent.AgentConfig{
+		Name:         "coder",
+		SystemPrompt: "you are coder",
+		ModelID:      "gpt-4o",
+	}}
+	svc := &AgentChatService{
+		chatRepo:  repo,
+		agentRepo: agentRepo,
+	}
+
+	sess, err := svc.CreateSession("tenant-a", "u1", "coder", "", "小红", "Xiao Hong")
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+	if sess.AgentID != "coder" {
+		t.Errorf("AgentID = %q, want coder", sess.AgentID)
+	}
+	if sess.Model != "gpt-4o" {
+		t.Errorf("Model = %q, want gpt-4o", sess.Model)
+	}
+	if sess.SystemPrompt != "you are coder" {
+		t.Errorf("SystemPrompt = %q", sess.SystemPrompt)
+	}
+	if sess.Mode != "agent_chat" {
+		t.Errorf("Mode = %q, want agent_chat", sess.Mode)
+	}
+	if sess.UserName != "小红" {
+		t.Errorf("UserName = %q, want 小红", sess.UserName)
+	}
+	if sess.DisplayName != "Xiao Hong" {
+		t.Errorf("DisplayName = %q, want Xiao Hong", sess.DisplayName)
+	}
+}
+
+func TestSaveUserMessage_StoresContent(t *testing.T) {
+	repo := newMockChatRepo()
+	agentRepo := &mockAgentRepoForChat{cfg: &agent.AgentConfig{Name: "coder"}}
+	svc := &AgentChatService{chatRepo: repo, agentRepo: agentRepo}
+
+	sess, _ := svc.CreateSession("tenant-a", "u1", "coder", "", "", "")
+	msg, err := svc.SaveUserMessage("tenant-a", "u1", sess.ID, "hello", nil)
+	if err != nil {
+		t.Fatalf("SaveUserMessage failed: %v", err)
+	}
+	if msg.Role != "user" {
+		t.Errorf("Role = %q, want user", msg.Role)
+	}
+	if msg.Content != `[{"type":"text","text":"hello"}]` {
+		t.Errorf("Content = %q", msg.Content)
+	}
+}
+
+func TestSaveAssistantMessage_StoresContent(t *testing.T) {
+	repo := newMockChatRepo()
+	agentRepo := &mockAgentRepoForChat{cfg: &agent.AgentConfig{Name: "coder"}}
+	svc := &AgentChatService{chatRepo: repo, agentRepo: agentRepo}
+
+	sess, _ := svc.CreateSession("tenant-a", "u1", "coder", "", "", "")
+	content := `[{"type":"text","text":"hi back"}]`
+	msg, err := svc.SaveAssistantMessage("tenant-a", "u1", sess.ID, content, "")
+	if err != nil {
+		t.Fatalf("SaveAssistantMessage failed: %v", err)
+	}
+	if msg.Role != "assistant" {
+		t.Errorf("Role = %q, want assistant", msg.Role)
+	}
+}
+
+func TestSaveAssistantMessage_StoresAigcLabel(t *testing.T) {
+	repo := newMockChatRepo()
+	agentRepo := &mockAgentRepoForChat{cfg: &agent.AgentConfig{Name: "coder"}}
+	svc := &AgentChatService{chatRepo: repo, agentRepo: agentRepo}
+
+	sess, _ := svc.CreateSession("tenant-a", "u1", "coder", "", "", "")
+	label := `{"Label":"1","ProduceID":"p-1"}`
+	msg, err := svc.SaveAssistantMessage("tenant-a", "u1", sess.ID, `[{"type":"text","text":"hi"}]`, label)
+	if err != nil {
+		t.Fatalf("SaveAssistantMessage failed: %v", err)
+	}
+	if msg.Aigc != label {
+		t.Errorf("Aigc = %q, want %q", msg.Aigc, label)
+	}
+}
+
+func TestDeleteSession_DelegatesToRepo(t *testing.T) {
+	repo := newMockChatRepo()
+	agentRepo := &mockAgentRepoForChat{cfg: &agent.AgentConfig{Name: "coder"}}
+	svc := &AgentChatService{chatRepo: repo, agentRepo: agentRepo}
+
+	sess, _ := svc.CreateSession("tenant-a", "u1", "coder", "", "", "")
+	repo.uploads["f-1"] = &chat.UploadRecord{
+		ID: "f-1", TenantID: "tenant-a", SessionID: sess.ID, Path: ".zerone-uploads/a.txt",
+	}
+	// CreateSession 归属 "coder"——绑定校验要求 :name 与会话 AgentID 一致。
+	if err := svc.DeleteSession("tenant-a", "u1", "coder", sess.ID); err != nil {
+		t.Fatalf("DeleteSession failed: %v", err)
+	}
+	if _, ok := repo.sessions[sess.ID]; ok {
+		t.Errorf("session still present after delete")
+	}
+	// issue #94 review R2 F3：上传记录（授权锚点）随会话在删除事务内一并清除。
+	if len(repo.uploads) != 0 {
+		t.Errorf("upload records still present after delete: %d", len(repo.uploads))
+	}
+}
+
+func TestDeleteSession_AgentBindingMismatch(t *testing.T) {
+	repo := newMockChatRepo()
+	agentRepo := &mockAgentRepoForChat{cfg: &agent.AgentConfig{Name: "coder"}}
+	svc := &AgentChatService{chatRepo: repo, agentRepo: agentRepo}
+
+	sess, _ := svc.CreateSession("tenant-a", "u1", "coder", "", "", "")
+	// 跨 Agent URL（PR #151 review P1）：:name 与会话归属不一致 → not-found 同形，会话保留。
+	if err := svc.DeleteSession("tenant-a", "u1", "other-agent", sess.ID); err == nil {
+		t.Fatal("DeleteSession with mismatched agent binding should fail")
+	}
+	if _, ok := repo.sessions[sess.ID]; !ok {
+		t.Error("session must survive a cross-agent delete attempt")
+	}
+}
+
+func TestSaveUserMessage_FilePartsBeforeText(t *testing.T) {
+	repo := newMockChatRepo()
+	agentRepo := &mockAgentRepoForChat{cfg: &agent.AgentConfig{Name: "coder"}}
+	svc := &AgentChatService{chatRepo: repo, agentRepo: agentRepo}
+
+	sess, _ := svc.CreateSession("tenant-a", "u1", "coder", "", "", "")
+	atts := []AttachmentDesc{{
+		ID: "f-1", Name: "report.pdf", Mime: "application/pdf", Size: 123, Path: ".zerone-uploads/report.pdf",
+	}}
+	msg, err := svc.SaveUserMessage("tenant-a", "u1", sess.ID, "请总结", atts)
+	if err != nil {
+		t.Fatalf("SaveUserMessage failed: %v", err)
+	}
+	want := `[{"type":"file","id":"f-1","name":"report.pdf","mime":"application/pdf","size":123,"path":".zerone-uploads/report.pdf"},` +
+		`{"type":"text","text":"请总结"}]`
+	if msg.Content != want {
+		t.Errorf("Content = %q\nwant %q", msg.Content, want)
+	}
+}
+
+func TestSaveUserMessage_PureAttachmentHasNoTextPart(t *testing.T) {
+	repo := newMockChatRepo()
+	agentRepo := &mockAgentRepoForChat{cfg: &agent.AgentConfig{Name: "coder"}}
+	svc := &AgentChatService{chatRepo: repo, agentRepo: agentRepo}
+
+	sess, _ := svc.CreateSession("tenant-a", "u1", "coder", "", "", "")
+	atts := []AttachmentDesc{{
+		ID: "f-1", Name: "a.png", Mime: "image/png", Size: 5, Path: ".zerone-uploads/a.png",
+	}}
+	msg, err := svc.SaveUserMessage("tenant-a", "u1", sess.ID, "", atts)
+	if err != nil {
+		t.Fatalf("SaveUserMessage failed: %v", err)
+	}
+	if msg.Content != `[{"type":"file","id":"f-1","name":"a.png","mime":"image/png","size":5,"path":".zerone-uploads/a.png"}]` {
+		t.Errorf("Content = %q", msg.Content)
+	}
+}

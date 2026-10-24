@@ -1,0 +1,1519 @@
+package database
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"log"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	"control-panel/internal/config"
+	"control-panel/internal/domain/agent"
+	"control-panel/internal/domain/agentrelation"
+	"control-panel/internal/domain/aigc"
+	"control-panel/internal/domain/audit"
+	authdomain "control-panel/internal/domain/auth"
+	"control-panel/internal/domain/capability"
+	"control-panel/internal/domain/chat"
+	"control-panel/internal/domain/collaboration"
+	"control-panel/internal/domain/decision"
+	eventdomain "control-panel/internal/domain/event"
+	"control-panel/internal/domain/extension"
+	"control-panel/internal/domain/extensionslot"
+	"control-panel/internal/domain/gameasset"
+	"control-panel/internal/domain/gamepackage"
+	"control-panel/internal/domain/gameproject"
+	"control-panel/internal/domain/mcp"
+	"control-panel/internal/domain/personality"
+	"control-panel/internal/domain/provider"
+	rundomain "control-panel/internal/domain/run"
+	"control-panel/internal/domain/scene"
+	"control-panel/internal/domain/skill"
+	"control-panel/internal/domain/systemsetting"
+	"control-panel/internal/domain/template"
+	"control-panel/internal/domain/usage"
+	"control-panel/internal/domain/workflow"
+
+	"github.com/glebarez/sqlite"
+	"gorm.io/driver/mysql"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
+)
+
+var DB *gorm.DB
+
+func InitDatabase(cfg *config.DatabaseConfig) error {
+	var err error
+
+	// Local dev convenience: a DATABASE_URL of the form "sqlite:<path>" uses an
+	// embedded SQLite database instead of MySQL (e.g. when Docker is not
+	// available). Production MySQL DSNs are unaffected. SQLite semantics are
+	// already exercised by the migration tests in this package.
+	dialector := gorm.Dialector(mysql.Open(cfg.URL))
+	if strings.HasPrefix(cfg.URL, "sqlite:") {
+		dialector = sqlite.Open(strings.TrimPrefix(cfg.URL, "sqlite:"))
+	}
+
+	DB, err = gorm.Open(dialector, &gorm.Config{
+		// Warn: only slow SQL and errors. Info would log every statement with
+		// full parameter values, leaking chat message contents into stdout.
+		Logger: logger.Default.LogMode(logger.Warn),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to connect to database: %w", err)
+	}
+
+	sqlDB, err := DB.DB()
+	if err != nil {
+		return fmt.Errorf("failed to get database instance: %w", err)
+	}
+
+	sqlDB.SetMaxIdleConns(cfg.MaxIdle)
+	sqlDB.SetMaxOpenConns(cfg.MaxOpen)
+	sqlDB.SetConnMaxLifetime(time.Duration(cfg.MaxLifetime) * time.Second)
+
+	log.Println("Database connected successfully")
+	return nil
+}
+
+func GetDB() *gorm.DB {
+	return DB
+}
+
+func Ping() error {
+	sqlDB, err := DB.DB()
+	if err != nil {
+		return err
+	}
+	return sqlDB.Ping()
+}
+
+func Close() error {
+	if DB != nil {
+		sqlDB, err := DB.DB()
+		if err != nil {
+			return err
+		}
+		return sqlDB.Close()
+	}
+	return nil
+}
+
+// defaultBackfillTenant 是 builtin 模式（单租户）的回填租户。
+// 本地常量而非 import internal/domain/tenant，避免 pkg → internal 的循环依赖。
+const defaultBackfillTenant = "default"
+
+// 包级变量，由 AutoMigrate 设置、各 migrate 回填函数消费。
+// 空串 = 未显式指定且无法从数据推断——BackfillTenantID 会在实际存在
+// 待回填行时报错兜底（仅歧义升级需要一次性显式配置）。
+var backfillTenantID = defaultBackfillTenant
+
+// resolveBackfillTenant 在未显式指定回填租户时从 user_identities 推断：
+// 恰好一个租户 → 该租户（单组织部署的升级语义：存量数据属于唯一存在的
+// 租户，无需任何配置）；0 个（新装库/更早版本的备份恢复）或多个
+// （多组织登录过，存量数据无法归属）→ 返回空串，交给 BackfillTenantID
+// 按是否存在待回填行决定放行或报错。必须在 user_identities 表存在后调用
+// （AutoMigrate 的 GORM 建表之后）。
+func resolveBackfillTenant() string {
+	if DB == nil {
+		return ""
+	}
+	var tenants []string
+	if err := DB.Raw("SELECT DISTINCT tenant_id FROM user_identities WHERE tenant_id != ''").Scan(&tenants).Error; err != nil {
+		return "" // 表不存在等查询失败：按无法推断处理
+	}
+	if len(tenants) == 1 {
+		log.Printf("未配置回填租户，已从 user_identities 自动推断为 %q（单租户部署）", tenants[0])
+		return tenants[0]
+	}
+	return ""
+}
+
+// --- 迁移互斥锁（P1）---
+
+const (
+	// migrationLockName 是 MySQL 命名锁名。GET_LOCK 的锁属于"会话"，
+	// 因此必须固定在同一条连接上 acquire/release，不能依赖连接池。
+	migrationLockName = "agenthub_schema_migrate"
+	// migrationLockTimeoutSeconds 是等待其它实例完成迁移的上限。
+	migrationLockTimeoutSeconds = 120
+)
+
+// acquireMigrationLock 在多副本部署下串行化整个迁移阶段，返回释放函数。
+// 非 MySQL（SQLite）直接返回空释放函数：单写库不存在并发迁移问题。
+func acquireMigrationLock() (func(), error) {
+	noop := func() {}
+	if DB == nil || DB.Dialector.Name() != "mysql" {
+		return noop, nil
+	}
+	sqlDB, err := DB.DB()
+	if err != nil {
+		return noop, fmt.Errorf("获取数据库连接池失败: %w", err)
+	}
+	ctx := context.Background()
+	// 关键：锁绑定在单条连接上（MySQL GET_LOCK 是会话级），释放后立刻
+	// 归还并关闭该连接，确保会话结束、锁一定被释放（进程崩溃也不会留下
+	// 悬挂锁）。
+	conn, err := sqlDB.Conn(ctx)
+	if err != nil {
+		return noop, fmt.Errorf("获取迁移专用连接失败: %w", err)
+	}
+	var acquired sql.NullInt64
+	if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, ?)", migrationLockName, migrationLockTimeoutSeconds).Scan(&acquired); err != nil {
+		conn.Close()
+		return noop, fmt.Errorf("获取数据库迁移锁失败: %w", err)
+	}
+	if !acquired.Valid || acquired.Int64 != 1 {
+		conn.Close()
+		return noop, fmt.Errorf("等待数据库迁移锁超时（%d 秒）：可能有另一个实例正在执行迁移，请稍后重试", migrationLockTimeoutSeconds)
+	}
+	log.Println("已获取数据库迁移锁，开始执行迁移")
+	return func() {
+		var released sql.NullInt64
+		if err := conn.QueryRowContext(ctx, "SELECT RELEASE_LOCK(?)", migrationLockName).Scan(&released); err != nil {
+			log.Printf("释放数据库迁移锁失败（连接关闭时会自动释放）: %v", err)
+		}
+		if err := conn.Close(); err != nil {
+			log.Printf("关闭迁移专用连接失败: %v", err)
+		}
+	}, nil
+}
+
+// --- 破坏性迁移开关（P1）---
+
+// destructiveMigrationsEnv 是删除类迁移（删列/删表）的显式开关。
+const destructiveMigrationsEnv = "ALLOW_DESTRUCTIVE_MIGRATIONS"
+
+// destructiveMigrationsAllowed 报告是否允许执行删除类迁移。默认关闭：
+// 本分支所有迁移只有 up 没有 down，删掉的数据/列回滚旧镜像也救不回来。
+var destructiveMigrationsAllowed = parseBoolEnv(destructiveMigrationsEnv)
+
+func parseBoolEnv(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+// skipDestructiveMigration 在未显式 opt-in 时记录可执行的警告并返回 true，
+// 表示调用方应跳过本次删除。跳过是安全的：这些都是无消费方的遗留结构，
+// 留在库里只是占位。
+func skipDestructiveMigration(what string) bool {
+	if destructiveMigrationsAllowed {
+		return false
+	}
+	log.Printf("跳过破坏性迁移（%s）：默认不执行删列/删表——本分支迁移只有 up 没有 down，删掉后回滚旧镜像也救不回。确认已完成备份后设置 %s=1 再启动。", what, destructiveMigrationsEnv)
+	return true
+}
+
+// AutoMigrate runs the automatic migration for all models.
+// backfillTenant 指定存量行空 tenant_id 的回填目标；传空表示未显式指定
+// （仅 casdoor 模式合法），AutoMigrate 会从 user_identities 自动推断；
+// 推断不出时若有待回填行，BackfillTenantID 会返回指引性错误。
+func AutoMigrate(backfillTenant string) error {
+	backfillTenantID = backfillTenant
+	if DB == nil {
+		return fmt.Errorf("database not initialized")
+	}
+
+	// 迁移串行化：多副本同时启动时，count-then-insert 的迁移会重复 INSERT
+	// 撞 1062，check-then-DDL 的迁移会重复 DROP COLUMN 撞 1091 —— 后者会让
+	// 后启动的副本直接启动失败。MySQL 用 GET_LOCK 把整个迁移阶段串起来；
+	// SQLite（单进程测试 / 单机部署）没有等价原语也不需要，直接跳过。
+	releaseLock, err := acquireMigrationLock()
+	if err != nil {
+		return err
+	}
+	defer releaseLock()
+
+	if err := migrateProviderAttributeIndex(); err != nil {
+		return fmt.Errorf("failed to migrate provider attribute index: %w", err)
+	}
+
+	err = DB.AutoMigrate(
+		&agent.AgentConfig{},
+		&personality.Template{},
+		&personality.Version{},
+		&agentrelation.AgentRelation{},
+		&agentrelation.RelationTypeTemplate{},
+		&agentrelation.RelationTypeVersion{},
+		&agentrelation.AgentRelationEvent{},
+		&agentrelation.AgentMessage{},
+		&agentrelation.AgentMessageDedupe{},
+		&agentrelation.AgentMessageReturnClaim{},
+		&agentrelation.AgentMessageDispatch{},
+		&agentrelation.AgentMessageDispatchCursor{},
+		&agentrelation.AgentMessageWait{},
+		&agent.AgentSubagent{},
+		&agent.AgentKnowledgeDataset{},
+		&agent.Tool{},
+		&agent.AgentTool{},
+		&agent.AgentSkill{},
+		&agent.DeploymentSnapshot{},
+		&mcp.McpServer{},
+		&mcp.AgentMcpServer{},
+		&scene.Scene{},
+		&skill.Skill{},
+		&chat.Session{},
+		&chat.Message{},
+		&chat.UploadRecord{},
+		&collaboration.Group{},
+		&collaboration.GroupMember{},
+		&collaboration.Channel{},
+		&collaboration.ChannelSubscription{},
+		&collaboration.Session{},
+		&collaboration.SessionParticipant{},
+		&collaboration.MemberAudit{},
+		&decision.Decision{},
+		&decision.Elector{},
+		&decision.Vote{},
+		&decision.Result{},
+		&decision.Audit{},
+		&decision.Escalation{},
+		&aigc.Config{},
+		&provider.ProviderSummary{},
+		&provider.ProviderAttribute{},
+		&authdomain.CLIToken{},
+		&authdomain.User{},
+		&authdomain.Invite{},
+		&authdomain.RefreshToken{},
+		&authdomain.UserIdentity{},
+		&authdomain.TenantOAuthClient{},
+		&audit.Log{},
+		&systemsetting.SystemSetting{},
+		&rundomain.PromptSnapshot{},
+		&rundomain.Run{},
+		&rundomain.RunAgent{},
+		&rundomain.RunRoutePlan{},
+		&rundomain.RunRouteStep{},
+		&rundomain.CapabilityBinding{},
+		&rundomain.StateSchema{},
+		&rundomain.RunState{},
+		&rundomain.RunStateChange{},
+		&rundomain.RunActivity{},
+		&rundomain.ToolResultRecord{},
+		&eventdomain.StreamCursor{},
+		&eventdomain.Envelope{},
+		&eventdomain.Delivery{},
+		&eventdomain.DeliveryAttempt{},
+		&eventdomain.CausalBudget{},
+		&capability.Package{},
+		&capability.ResourceProvenance{},
+		&extension.Extension{},
+		&extension.Version{},
+		&extension.Install{},
+		&extension.Grant{},
+		&extension.AccessAudit{},
+		&gamepackage.Package{},
+		&gameasset.Asset{},
+		&gameproject.Project{},
+		&gameproject.Release{},
+		&gameproject.Session{},
+		&gameproject.PlayerPlan{},
+		&extensionslot.Override{},
+		&template.TemplateDefinition{},
+		&template.TemplateVersion{},
+		&template.TemplateInstall{},
+		&usage.UsageRecord{},
+		&usage.UsageBudget{},
+		&usage.UsageAlert{},
+		&usage.UsageAlertEvent{},
+		&workflow.Definition{},
+		&workflow.Version{},
+		&workflow.Step{},
+		&workflow.Transition{},
+		&workflow.Execution{},
+		&workflow.StepRun{},
+		&workflow.StepDispatch{},
+		&workflow.StepReceipt{},
+		&workflow.Approval{},
+		&workflow.ApprovalDecision{},
+		&workflow.Audit{},
+	)
+	if err != nil {
+		return fmt.Errorf("failed to auto migrate: %w", err)
+	}
+
+	if err := backfillAgentRelationScores(); err != nil {
+		return fmt.Errorf("failed to backfill agent relation scores: %w", err)
+	}
+
+	if err := migrateBindingFKRESTRICT(); err != nil {
+		return fmt.Errorf("failed to migrate binding FK RESTRICT: %w", err)
+	}
+
+	// 未显式指定回填租户（casdoor 模式未配 CASDOOR_ORGANIZATION）：建表后
+	// 从 user_identities 推断。推断不出则保持空串，由 BackfillTenantID 按
+	// 是否存在待回填行决定放行（no-op）或报错（歧义升级需一次性显式配置）。
+	if backfillTenantID == "" {
+		backfillTenantID = resolveBackfillTenant()
+	}
+
+	if err := migrateProviderSplit(); err != nil {
+		return fmt.Errorf("failed to migrate provider split: %w", err)
+	}
+
+	if err := migrateProviderModels(); err != nil {
+		return fmt.Errorf("failed to migrate provider models: %w", err)
+	}
+
+	if err := migrateProviderOcrEndpointsBackfill(); err != nil {
+		return fmt.Errorf("failed to backfill OCR endpoint models: %w", err)
+	}
+
+	if err := migrateDropLegacyProviderColumns(); err != nil {
+		return fmt.Errorf("failed to drop legacy provider columns: %w", err)
+	}
+
+	if err := migrateDropLegacyTenantDomain(); err != nil {
+		return fmt.Errorf("failed to drop legacy tenant domain: %w", err)
+	}
+
+	if err := migrateDropToolRequiredColumn(); err != nil {
+		return fmt.Errorf("failed to drop tool required column: %w", err)
+	}
+
+	if err := migrateAgentPlatformFlags(); err != nil {
+		return fmt.Errorf("failed to migrate agent platform flags: %w", err)
+	}
+
+	if err := migrateMaxSessionQueries(); err != nil {
+		return fmt.Errorf("failed to migrate max session queries column: %w", err)
+	}
+
+	if err := migrateAigcModelCodes(DB); err != nil {
+		return fmt.Errorf("failed to migrate aigc model codes: %w", err)
+	}
+
+	if err := migrateSessionIndexes(); err != nil {
+		return fmt.Errorf("failed to migrate session indexes: %w", err)
+	}
+
+	if err := migrateChatTenantID(); err != nil {
+		return fmt.Errorf("failed to migrate chat tenant id: %w", err)
+	}
+
+	if err := migrateAgentsTenantID(); err != nil {
+		return fmt.Errorf("failed to migrate agents tenant id: %w", err)
+	}
+
+	if err := migrateProvidersTenantID(); err != nil {
+		return fmt.Errorf("failed to migrate providers tenant id: %w", err)
+	}
+
+	if err := migrateMcpToolsSkillsScenesTenantID(); err != nil {
+		return fmt.Errorf("failed to migrate mcp/tools/skills/scenes tenant id: %w", err)
+	}
+
+	if err := migrateDropLegacyUkTenantName(); err != nil {
+		return fmt.Errorf("failed to drop legacy uk_tenant_name indexes: %w", err)
+	}
+
+	if err := migrateAigcConfigsTenantID(); err != nil {
+		return fmt.Errorf("failed to migrate aigc_configs tenant id: %w", err)
+	}
+
+	if err := migrateDropVendorPresets(); err != nil {
+		return fmt.Errorf("failed to drop vendor_presets: %w", err)
+	}
+
+	if err := migrateTenantDefaultKeySentinel(); err != nil {
+		return fmt.Errorf("migrate tenant default_key sentinel: %w", err)
+	}
+
+	if err := migrateToolsSource(); err != nil {
+		return fmt.Errorf("migrate tools source column: %w", err)
+	}
+
+	log.Println("Database migration completed successfully")
+	return nil
+}
+
+// backfillAgentRelationScores initializes the numeric state for relationship
+// rows created before dynamic scoring existed. New rows always set
+// last_changed_at in AgentRelationService, so the NULL predicate makes this
+// migration idempotent without disturbing relationships that have evolved.
+func backfillAgentRelationScores() error {
+	now := time.Now().UTC()
+	for stance := range agentrelation.Stances {
+		if err := DB.Model(&agentrelation.AgentRelation{}).
+			Where("last_changed_at IS NULL AND stance = ?", stance).
+			UpdateColumns(map[string]interface{}{
+				"relationship_score": agentrelation.InitialScoreForStance(stance),
+				"last_changed_at":    now,
+			}).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migrateTenantDefaultKeySentinel 把 default_key 列存量值归一为哨兵常量
+// （authdomain.DefaultKeySentinel）。历史版本写入 org 名，不同 org 互不碰撞，
+// uk_default_key 唯一索引无法兜底「最多一行 default」；归一为常量后索引
+// 恢复兜底。若存量已被并发竞态污染出多行 default，先按 MIN(org) 确定性
+// 保留一行、其余置 NULL（自愈），再统一改写哨兵值。幂等可重复执行。
+func migrateTenantDefaultKeySentinel() error {
+	if !DB.Migrator().HasTable(&authdomain.TenantOAuthClient{}) {
+		return nil
+	}
+	var n int64
+	if err := DB.Model(&authdomain.TenantOAuthClient{}).
+		Where("default_key IS NOT NULL").Count(&n).Error; err != nil {
+		return err
+	}
+	if n == 0 {
+		return nil
+	}
+	if n > 1 {
+		// 子查询套派生表强制物化：MySQL 1093 禁止 UPDATE 的 WHERE 子查询直接
+		// FROM 目标表，派生表可绕过（sqlite 亦兼容，语义不变）。
+		if err := DB.Exec(`UPDATE tenant_oauth_clients SET default_key = NULL
+			WHERE default_key IS NOT NULL
+			AND org != (SELECT min_org FROM (SELECT MIN(org) AS min_org FROM tenant_oauth_clients WHERE default_key IS NOT NULL) dt)`).Error; err != nil {
+			return err
+		}
+		log.Printf("[migrate] tenant_oauth_clients: 检测到 %d 行 default（历史竞态污染），已按 MIN(org) 保留一行", n)
+	}
+	return DB.Exec("UPDATE tenant_oauth_clients SET default_key = ? WHERE default_key IS NOT NULL AND default_key != ?",
+		authdomain.DefaultKeySentinel, authdomain.DefaultKeySentinel).Error
+}
+
+// migrateToolsSource 归一 tools.source 列（issue #88）：
+//   - 共享行（tenant_id=”）且 name ∈ PresetToolNames → builtin；
+//   - source 为空/NULL 的行（防御，正常路径不存在）→ custom；
+//   - custom 行强制 is_default=false（领域约束：默认工具仅 builtin 可任），
+//     既有 agent_tools 关联保留不动（不静默删数据）。
+//
+// 幂等：条件不满足的行第二次运行不再命中。
+func migrateToolsSource() error {
+	if err := DB.Model(&agent.Tool{}).
+		Where("tenant_id = '' AND name IN ?", agent.PresetToolNames).
+		Where("source IS NULL OR source = '' OR source = ?", agent.ToolSourceCustom).
+		Update("source", agent.ToolSourceBuiltin).Error; err != nil {
+		return fmt.Errorf("mark builtin tools: %w", err)
+	}
+	if err := DB.Model(&agent.Tool{}).
+		Where("source IS NULL OR source = ''").
+		Update("source", agent.ToolSourceCustom).Error; err != nil {
+		return fmt.Errorf("normalize custom tools: %w", err)
+	}
+	if err := DB.Model(&agent.Tool{}).
+		Where("source = ? AND is_default = ?", agent.ToolSourceCustom, true).
+		Update("is_default", false).Error; err != nil {
+		return fmt.Errorf("clear is_default on custom tools: %w", err)
+	}
+	return nil
+}
+
+// migrateProviderSplit copies rows from the legacy vendor_presets backup
+// table into the new provider_summaries table — but ONLY when the new
+// table is empty (idempotent). The legacy table is dropped for good by
+// migrateDropVendorPresets at the end of the chain; on databases where it
+// is already gone (fresh installs) this is a no-op.
+func migrateProviderSplit() error {
+	var summaryCount int64
+	if err := DB.Model(&provider.ProviderSummary{}).Count(&summaryCount).Error; err != nil {
+		return err
+	}
+	if summaryCount > 0 {
+		// Already migrated; never touch the legacy table again.
+		return nil
+	}
+
+	if !DB.Migrator().HasTable("vendor_presets") {
+		// Fresh database or already dropped — nothing to salvage.
+		return nil
+	}
+
+	var legacyCount int64
+	if err := DB.Raw("SELECT COUNT(*) FROM `vendor_presets`").Scan(&legacyCount).Error; err != nil {
+		return err
+	}
+	if legacyCount == 0 {
+		// Nothing to migrate.
+		return nil
+	}
+
+	log.Printf("Migrating %d legacy vendor_presets rows into provider_summaries...", legacyCount)
+
+	// Raw column copy of descriptive fields only. default_models is
+	// intentionally excluded: provider_summaries no longer has that
+	// column (Task 7 moved models to the provider_models table), so
+	// including it would break the INSERT on stale upgrades where
+	// vendor_presets is populated but provider_summaries is empty.
+	// Trade-off: stale upgraders lose custom models from the legacy
+	// JSON blob; SeedIfEmpty in provider_service.go reseeds defaults.
+	if err := DB.Exec(`
+		INSERT INTO provider_summaries
+			(id, ` + "`key`" + `, name, description, description_en, protocol, auth_style,
+			 base_url, fields, icon_key, builtin, locked_api_key,
+			 created_at, updated_at)
+		SELECT
+			 id, ` + "`key`" + `, name, description, description_en, protocol, auth_style,
+			 base_url, fields, icon_key, builtin, locked_api_key,
+			 created_at, updated_at
+		FROM vendor_presets
+	`).Error; err != nil {
+		return fmt.Errorf("copy vendor_presets -> provider_summaries failed: %w", err)
+	}
+
+	log.Println("Provider split migration completed")
+	return nil
+}
+
+// migrateDropLegacyProviderColumns drops the default_models and type columns
+// from provider_summaries. These were replaced by the provider_models table
+// (model_type column) in earlier migrations. The drop MUST run after
+// migrateProviderModels() so the JSON backfill can still read default_models.
+// Idempotent: checks HasColumn before dropping.
+//
+// Uses raw SQL ALTER TABLE DROP COLUMN rather than GORM's
+// migrator.DropColumn because the latter silently no-ops on SQLite when the
+// field is absent from the struct (and rebuilds via the struct schema, which
+// skips fields not on the struct). Raw SQL works uniformly on MySQL and
+// modern SQLite (>= 3.35, which glebarez/sqlite bundles). Backticks quote
+// the reserved word `type` on both engines.
+func migrateDropLegacyProviderColumns() error {
+	if DB == nil {
+		return nil
+	}
+	if skipDestructiveMigration("provider_summaries 遗留列 default_models/type") {
+		return nil
+	}
+	migrator := DB.Migrator()
+	if migrator.HasColumn(&provider.ProviderSummary{}, "default_models") {
+		if err := DB.Exec("ALTER TABLE provider_summaries DROP COLUMN `default_models`").Error; err != nil {
+			return fmt.Errorf("drop default_models failed: %w", err)
+		}
+		log.Println("Dropped legacy column provider_summaries.default_models")
+	}
+	if migrator.HasColumn(&provider.ProviderSummary{}, "type") {
+		if err := DB.Exec("ALTER TABLE provider_summaries DROP COLUMN `type`").Error; err != nil {
+			return fmt.Errorf("drop type failed: %w", err)
+		}
+		log.Println("Dropped legacy column provider_summaries.type")
+	}
+	return nil
+}
+
+// migrateDropVendorPresets drops the legacy vendor_presets backup table for
+// good — provider_summaries / provider_attributes have been the source of
+// truth long enough to be considered stable, and multi-tenant Phase 3 made
+// the legacy single-tenant table moot anyway. Runs last in the chain so
+// migrateProviderSplit still gets a chance to salvage rows from stale
+// databases first. Idempotent: HasTable guard, no-op when already dropped.
+func migrateDropVendorPresets() error {
+	if DB == nil {
+		return nil
+	}
+	if skipDestructiveMigration("遗留备份表 vendor_presets") {
+		return nil
+	}
+	migrator := DB.Migrator()
+	if migrator.HasTable("vendor_presets") {
+		if err := DB.Exec("DROP TABLE `vendor_presets`").Error; err != nil {
+			return fmt.Errorf("drop vendor_presets failed: %w", err)
+		}
+		log.Println("Dropped legacy table vendor_presets")
+	}
+	return nil
+}
+
+// migrateDropLegacyTenantDomain removes the pre-Casdoor self-built
+// multi-tenancy leftovers: the dead tenants / service_deployments /
+// resources tables, plus the stray tenant_id + casdoor_user_id columns that
+// the legacy tenant.User model leaked into the shared users table via
+// AutoMigrate. Casdoor 模式下组织管理不接管，租户标识直接走 JWT org 名
+// （user_identities.tenant_id），这套遗留结构无任何消费方。
+// Idempotent: HasTable/HasColumn guards; raw SQL for the same
+// SQLite-vs-MySQL uniformity reasons as migrateDropLegacyProviderColumns.
+func migrateDropLegacyTenantDomain() error {
+	if DB == nil {
+		return nil
+	}
+	if skipDestructiveMigration("遗留表 service_deployments/resources/tenants 与 users 游离列 tenant_id/casdoor_user_id") {
+		return nil
+	}
+	migrator := DB.Migrator()
+	for _, table := range []string{"service_deployments", "resources", "tenants"} {
+		if migrator.HasTable(table) {
+			if err := DB.Exec(fmt.Sprintf("DROP TABLE `%s`", table)).Error; err != nil {
+				return fmt.Errorf("drop %s failed: %w", table, err)
+			}
+			log.Printf("Dropped legacy table %s", table)
+		}
+	}
+	// users 表被 legacy tenant.User 混入的游离列（auth.User 才是 users 表的
+	// owner，不认识这两列）。builtin 模式下 users 表仍承载登录，只清列不删表。
+	for _, col := range []string{"tenant_id", "casdoor_user_id"} {
+		if migrator.HasColumn("users", col) {
+			if err := DB.Exec(fmt.Sprintf("ALTER TABLE users DROP COLUMN `%s`", col)).Error; err != nil {
+				return fmt.Errorf("drop users.%s failed: %w", col, err)
+			}
+			log.Printf("Dropped legacy column users.%s", col)
+		}
+	}
+	return nil
+}
+
+// migrateAgentPlatformFlags backfills agents.desktop_enabled from the legacy
+// `enabled` column and then drops that column. The new desktop_enabled /
+// mobile_enabled columns themselves are created by AutoMigrate from the model
+// tags. Idempotent: a no-op once the legacy column is gone.
+//
+// 刻意不受 ALLOW_DESTRUCTIVE_MIGRATIONS 约束：这里的 backfill 与 drop 是一次
+// 重命名（copy 到新列 + 删旧列）的两半，必须原子执行。只跳过 drop 会让
+// `UPDATE agents SET desktop_enabled = enabled` 每次启动都重跑，把运维后来
+// 改过的 desktop_enabled 用陈旧列的值反复覆盖回去 —— 比删列本身危险。
+func migrateAgentPlatformFlags() error {
+	// information_schema 是 MySQL 专有；sqlite（迁移测试）直接跳过——本函数
+	// 只处理遗留 enabled 列的回填/删除，不影响加列与租户回填。
+	if DB.Dialector.Name() != "mysql" {
+		return nil
+	}
+	var colCount int
+	if err := DB.Raw(
+		"SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'agents' AND COLUMN_NAME = 'enabled'",
+	).Scan(&colCount).Error; err != nil {
+		return err
+	}
+	if colCount == 0 {
+		return nil
+	}
+	log.Println("Backfilling agents.desktop_enabled from legacy enabled column...")
+	if err := DB.Exec("UPDATE agents SET desktop_enabled = enabled").Error; err != nil {
+		return fmt.Errorf("failed to backfill desktop_enabled: %w", err)
+	}
+	if err := DB.Exec("ALTER TABLE agents DROP COLUMN enabled").Error; err != nil {
+		return fmt.Errorf("failed to drop legacy enabled column: %w", err)
+	}
+	return nil
+}
+
+// migrateMaxSessionQueries migrates the legacy max_session_turns column so
+// existing values survive the SDK 3.1.0 key rename to maxSessionQueries
+// (issue #111). MySQL-only: sqlite test schemas are created by AutoMigrate
+// with the new column already. Backfill-then-drop instead of CHANGE COLUMN:
+// AutoMigrate (which runs first in the sequence) has already added
+// max_session_queries, so a rename would always hit a duplicate-column
+// error. Idempotent: a no-op once the legacy column is gone.
+//
+// 与 migrateAgentPlatformFlags 同理，这里的 backfill+drop 是重命名的两半，
+// 刻意不受 ALLOW_DESTRUCTIVE_MIGRATIONS 约束（只跳过 drop 会让回填每启动重跑）。
+func migrateMaxSessionQueries() error {
+	// information_schema 是 MySQL 专有；sqlite（迁移测试）直接跳过——本函数
+	// 只处理遗留 max_session_turns 列的回填/删除，不影响加列与租户回填。
+	if DB.Dialector.Name() != "mysql" {
+		return nil
+	}
+	var colCount int
+	if err := DB.Raw(
+		"SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'agents' AND COLUMN_NAME = 'max_session_turns'",
+	).Scan(&colCount).Error; err != nil {
+		return err
+	}
+	if colCount == 0 {
+		return nil
+	}
+	log.Println("Migrating agents.max_session_turns to max_session_queries...")
+	// WHERE ... IS NOT NULL: a NULL legacy value must not overwrite a
+	// non-NULL max_session_queries from an earlier upgrade. Without the
+	// guard, a "new hub → rollback (old hub AutoMigrate recreates
+	// max_session_turns all-NULL) → upgrade again" cycle would clobber the
+	// previously backfilled values with NULL.
+	if err := DB.Exec("UPDATE agents SET max_session_queries = max_session_turns WHERE max_session_turns IS NOT NULL").Error; err != nil {
+		return fmt.Errorf("failed to backfill max_session_queries: %w", err)
+	}
+	if err := DB.Exec("ALTER TABLE agents DROP COLUMN max_session_turns").Error; err != nil {
+		return fmt.Errorf("failed to drop legacy max_session_turns column: %w", err)
+	}
+	return nil
+}
+
+// migrateProviderAttributeIndex fixes the uk_provider_attr index.
+// Originally it was a single-column unique index on (attr_key) alone, but the
+// correct constraint is a composite unique index on (provider_id, attr_key).
+// GORM AutoMigrate cannot drop/modify existing indexes, so we do it here:
+// 1. Drop the old single-column uk_provider_attr index if it exists.
+// 2. Delete orphan rows (provider deleted but attributes remained).
+// AutoMigrate then recreates uk_provider_attr as a composite index per the
+// updated GORM tags in model.go.
+func migrateProviderAttributeIndex() error {
+	// information_schema 是 MySQL 专有；sqlite（迁移测试）直接跳过——
+	// 本函数只做索引修正/孤儿行清理，不影响加列与数据回填。
+	if DB.Dialector.Name() != "mysql" {
+		return nil
+	}
+	var tableExists bool
+	if err := DB.Raw(
+		"SELECT COUNT(*) > 0 FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'provider_attributes'",
+	).Scan(&tableExists).Error; err != nil {
+		return err
+	}
+	if !tableExists {
+		return nil
+	}
+
+	// Check if the old single-column index exists (attr_key alone).
+	var idxCount int64
+	if err := DB.Raw(
+		"SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'provider_attributes' AND INDEX_NAME = 'uk_provider_attr'",
+	).Scan(&idxCount).Error; err != nil {
+		return err
+	}
+	if idxCount > 0 {
+		// 注意：这一次 DROP INDEX 刻意不受 ALLOW_DESTRUCTIVE_MIGRATIONS 约束。
+		// 它不是"清理遗留结构"，而是"重建索引"的第一步——同名旧索引不先删掉，
+		// 紧随其后的 AutoMigrate 无法建出复合索引 uk_provider_attr，会直接
+		// 启动失败。重命名/重建类操作不能加开关，否则开关一关就是启不来。
+		log.Println("Dropping old single-column uk_provider_attr index from provider_attributes...")
+		if err := DB.Exec("DROP INDEX uk_provider_attr ON provider_attributes").Error; err != nil {
+			return fmt.Errorf("failed to drop old uk_provider_attr index: %w", err)
+		}
+		log.Println("Old index dropped; AutoMigrate will recreate as composite (provider_id, attr_key)")
+	}
+
+	// Delete orphan rows where provider_id references a deleted provider.
+	var orphanCount int64
+	if err := DB.Raw(
+		"SELECT COUNT(*) FROM provider_attributes pa LEFT JOIN provider_summaries ps ON pa.provider_id = ps.id WHERE ps.id IS NULL",
+	).Scan(&orphanCount).Error; err != nil {
+		return err
+	}
+	if orphanCount > 0 {
+		log.Printf("Cleaning up %d orphan provider_attributes rows...", orphanCount)
+		if err := DB.Exec(
+			"DELETE pa FROM provider_attributes pa LEFT JOIN provider_summaries ps ON pa.provider_id = ps.id WHERE ps.id IS NULL",
+		).Error; err != nil {
+			return fmt.Errorf("failed to clean up orphan attributes: %w", err)
+		}
+		log.Println("Orphan attributes cleaned up")
+	}
+
+	return nil
+}
+
+func migrateDropToolRequiredColumn() error {
+	var count int64
+	if err := DB.Model(&agent.Tool{}).Where("1=1").Limit(1).Count(&count).Error; err != nil {
+		return err
+	}
+
+	// 用 Migrator().HasColumn 而非 information_schema——后者是 MySQL 专有，
+	// sqlite（迁移测试）没有该表。
+	hasColumn := DB.Migrator().HasColumn("tools", "required")
+
+	if hasColumn {
+		if skipDestructiveMigration("tools 遗留列 required") {
+			return nil
+		}
+		log.Println("Dropping 'required' column from 'tools' table...")
+		if err := DB.Exec("ALTER TABLE tools DROP COLUMN required").Error; err != nil {
+			return err
+		}
+		log.Println("'required' column dropped successfully")
+	}
+
+	return nil
+}
+
+// legacyProviderSummary mirrors the provider_summaries row shape as it
+// existed BEFORE Task 7 — including the now-dropped default_models JSON
+// blob and type column. It is used only by migrateProviderModels() to
+// backfill provider_models from the legacy data on databases that still
+// have those columns. Reading via this struct lets the production
+// ProviderSummary shed the legacy fields.
+type legacyProviderSummary struct {
+	ID            uint64 `gorm:"column:id"`
+	Key           string `gorm:"column:key"`
+	Protocol      string `gorm:"column:protocol"`
+	Type          string `gorm:"column:type"`
+	DefaultModels string `gorm:"column:default_models"`
+}
+
+// migrateProviderModels creates the provider_models table and backfills it
+// from the legacy default_models JSON column. Idempotent: a no-op if the
+// table already has rows. model_type per row = JSON's modelType if present,
+// otherwise the provider's type column, otherwise derived from protocol.
+//
+// Reads via legacyProviderSummary so this works on databases that still
+// have the legacy columns (they are dropped by migrateDropLegacyProviderColumns
+// immediately after this run).
+func migrateProviderModels() error {
+	if DB == nil {
+		return nil
+	}
+
+	// AutoMigrate is safe to call repeatedly.
+	if err := DB.AutoMigrate(&provider.ProviderModel{}); err != nil {
+		return fmt.Errorf("auto-migrate provider_models failed: %w", err)
+	}
+
+	// Skip if already populated (idempotency).
+	var existingCount int64
+	if err := DB.Model(&provider.ProviderModel{}).Count(&existingCount).Error; err != nil {
+		return fmt.Errorf("count provider_models failed: %w", err)
+	}
+	if existingCount > 0 {
+		return nil
+	}
+
+	// If the legacy default_models column is already gone (fresh installs
+	// post-Task-7, or schemas built from the new struct), there is nothing
+	// to backfill from.
+	if !DB.Migrator().HasColumn(&provider.ProviderSummary{}, "default_models") {
+		return nil
+	}
+
+	// The legacy `type` column may already be gone on some databases;
+	// include it only when present. When absent, the model-type fallback
+	// falls through to protocol-based derivation below.
+	selectCols := "id, `key`, protocol, default_models"
+	if DB.Migrator().HasColumn(&provider.ProviderSummary{}, "type") {
+		selectCols = "id, `key`, protocol, type, default_models"
+	}
+
+	var summaries []legacyProviderSummary
+	if err := DB.Table("provider_summaries").
+		Select(selectCols).
+		Find(&summaries).Error; err != nil {
+		return fmt.Errorf("load provider_summaries failed: %w", err)
+	}
+
+	for _, s := range summaries {
+		if s.DefaultModels == "" || s.DefaultModels == "[]" {
+			continue
+		}
+		var models []provider.CatalogModel
+		if err := json.Unmarshal([]byte(s.DefaultModels), &models); err != nil {
+			log.Printf("migrateProviderModels: skip provider %s (unmarshal error: %v)", s.Key, err)
+			continue
+		}
+		for i, m := range models {
+			mt := m.ModelType
+			if mt == "" {
+				mt = s.Type
+			}
+			if mt == "" {
+				// Inline derivation (kept in sync with the old TypeForProtocol).
+				switch provider.Protocol(s.Protocol) {
+				case provider.ProtocolMinerU, provider.ProtocolPaddleOCR:
+					mt = string(provider.TypeOCR)
+				default:
+					mt = string(provider.TypeLLM)
+				}
+			}
+			selectionID := m.SelectionID
+			if selectionID == "" {
+				selectionID = m.ModelID
+			}
+			row := provider.ProviderModel{
+				ProviderID:    s.ID,
+				SelectionID:   selectionID,
+				ModelID:       m.ModelID,
+				DisplayName:   m.DisplayName,
+				ModelType:     mt,
+				ContextWindow: m.ContextWindow,
+				Status:        "1",
+				SortOrder:     i,
+			}
+			if err := DB.Create(&row).Error; err != nil {
+				log.Printf("migrateProviderModels: insert failed for %s/%s: %v", s.Key, selectionID, err)
+			}
+		}
+	}
+
+	log.Printf("migrateProviderModels: backfill complete (%d providers scanned)", len(summaries))
+	return nil
+}
+
+// migrateProviderOcrEndpointsBackfill ensures endpoint-only OCR providers
+// (MinerU, PaddleOCR) have at least one row in provider_models. These
+// providers historically carried an empty defaultModels slice because the
+// endpoint itself IS the service — there was no per-model catalog. After
+// Task 7 moved filtering to provider_models.model_type, an empty slice
+// meant these providers stopped appearing under ?type=ocr and lost their
+// capability chip in the UI.
+//
+// This migration inserts a single "default" OCR model for any provider
+// with protocol mineru/paddleocr that currently has zero model rows.
+// Idempotent: once the row exists, subsequent runs are no-op.
+func migrateProviderOcrEndpointsBackfill() error {
+	if DB == nil {
+		return nil
+	}
+
+	var endpoints []provider.ProviderSummary
+	if err := DB.Where("protocol IN ?", []string{
+		string(provider.ProtocolMinerU),
+		string(provider.ProtocolPaddleOCR),
+	}).Find(&endpoints).Error; err != nil {
+		return fmt.Errorf("load OCR endpoint providers failed: %w", err)
+	}
+
+	for _, ep := range endpoints {
+		var modelCount int64
+		if err := DB.Model(&provider.ProviderModel{}).
+			Where("provider_id = ?", ep.ID).
+			Count(&modelCount).Error; err != nil {
+			return fmt.Errorf("count models for %s failed: %w", ep.Key, err)
+		}
+		if modelCount > 0 {
+			continue
+		}
+
+		row := provider.ProviderModel{
+			ProviderID:  ep.ID,
+			SelectionID: ep.Key,
+			ModelID:     ep.Key,
+			DisplayName: ep.Name,
+			ModelType:   string(provider.TypeOCR),
+			Status:      "1",
+			SortOrder:   0,
+		}
+		if err := DB.Create(&row).Error; err != nil {
+			log.Printf("migrateProviderOcrEndpointsBackfill: insert failed for %s: %v", ep.Key, err)
+			continue
+		}
+		log.Printf("migrateProviderOcrEndpointsBackfill: inserted default OCR model for %s", ep.Key)
+	}
+	return nil
+}
+
+// migrateAigcModelCodes is a one-time migration: backfills the new
+// provider_models.aigc_code column from the legacy aigc_configs.model_codes
+// JSON blob (preserving codes already deployed to production), assigns
+// sequential codes to any remaining rows, then DROPs the legacy column.
+//
+// Idempotent: if provider_models already has any non-empty aigc_code, the
+// backfill is skipped (still attempts the column drop, which is itself a
+// no-op if the column is already gone).
+//
+// GORM's struct-based HasColumn/DropColumn(&aigc.Config{}, "ModelCodes")
+// cannot be used here because Task 5 removed ModelCodes from the struct.
+// HasColumn accepts table+column strings, but DropColumn on glebarez/sqlite
+// rebuilds the table via the struct schema and panics when handed a bare
+// table name with no model. We use raw SQL ALTER TABLE DROP COLUMN, matching
+// the approach in migrateDropLegacyProviderColumns (works uniformly on MySQL
+// and modern SQLite >= 3.35, which glebarez/sqlite bundles).
+func migrateAigcModelCodes(db *gorm.DB) error {
+	// Idempotency: skip backfill if any model row already has a code.
+	var alreadyAssigned int64
+	db.Table("provider_models").Where("aigc_code <> ''").Count(&alreadyAssigned)
+	if alreadyAssigned == 0 {
+		if err := backfillAigcModelCodes(db); err != nil {
+			return fmt.Errorf("backfill aigc model codes: %w", err)
+		}
+	}
+	if db.Migrator().HasColumn("aigc_configs", "model_codes") {
+		if skipDestructiveMigration("aigc_configs 遗留列 model_codes") {
+			return nil
+		}
+		if err := db.Exec("ALTER TABLE aigc_configs DROP COLUMN model_codes").Error; err != nil {
+			return fmt.Errorf("drop aigc_configs.model_codes column: %w", err)
+		}
+	}
+	return nil
+}
+
+// backfillAigcModelCodes reads the legacy aigc_configs.model_codes JSON blob
+// (keyed by ModelID) and writes the matched code onto the corresponding
+// provider_models rows. Rows whose ModelID is not in the blob get the next
+// sequentially-available 4-digit code (counting up from the max code seen
+// so far, blob- or pass-assigned). When the same ModelID appears across
+// multiple providers, all rows share the code assigned on its first sighting.
+func backfillAigcModelCodes(db *gorm.DB) error {
+	// Load legacy blob if the column still exists.
+	blobCodes := map[string]string{}
+	if db.Migrator().HasColumn("aigc_configs", "model_codes") {
+		var blob string
+		row := db.Table("aigc_configs").Select("model_codes").Where("id = 1").Row()
+		if err := row.Scan(&blob); err == nil && blob != "" {
+			_ = json.Unmarshal([]byte(blob), &blobCodes)
+		}
+	}
+
+	var rows []provider.ProviderModel
+	if err := db.Order("id ASC").Find(&rows).Error; err != nil {
+		return err
+	}
+	assigned := make(map[string]string, len(rows))
+	max := 0
+	for _, r := range rows {
+		if r.ModelID == "" {
+			continue
+		}
+		if code, ok := assigned[r.ModelID]; ok {
+			// already assigned earlier in this pass (cross-row same ModelID)
+			if err := db.Model(&provider.ProviderModel{}).Where("id = ?", r.ID).Update("aigc_code", code).Error; err != nil {
+				return err
+			}
+			continue
+		}
+		var code string
+		if c, ok := blobCodes[r.ModelID]; ok {
+			code = c
+		} else {
+			max++
+			code = fmt.Sprintf("%04d", max)
+		}
+		assigned[r.ModelID] = code
+		if n, err := strconv.Atoi(code); err == nil && n > max {
+			max = n
+		}
+		if err := db.Model(&provider.ProviderModel{}).Where("id = ?", r.ID).Update("aigc_code", code).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migrateSessionIndexes adds the updated_at index to cloud_sessions if missing.
+// Without this index, ORDER BY updated_at DESC triggers a full-table in-memory
+// sort that can exhaust MySQL's sort_buffer_size on large tables.
+func migrateSessionIndexes() error {
+	if DB == nil {
+		return nil
+	}
+	if DB.Migrator().HasIndex(&chat.Session{}, "UpdatedAt") {
+		return nil
+	}
+	log.Println("Adding updated_at index to cloud_sessions...")
+	if err := DB.Migrator().CreateIndex(&chat.Session{}, "UpdatedAt"); err != nil {
+		return fmt.Errorf("create updated_at index on cloud_sessions: %w", err)
+	}
+	log.Println("cloud_sessions updated_at index created")
+	return nil
+}
+
+// migrateChatTenantID backfills tenant_id on cloud_sessions / cloud_messages.
+// The column itself is added by AutoMigrate from the model tags.
+func migrateChatTenantID() error {
+	if DB == nil {
+		return nil
+	}
+	// 加列由 AutoMigrate 完成；这里回填：
+	// 1) 能经 user_id → user_identities.tenant_id 映射的按映射回填
+	// 2) 映射不到的（历史脏数据）回填启动租户
+	for _, table := range []string{"cloud_sessions", "cloud_messages"} {
+		if !DB.Migrator().HasColumn(table, "tenant_id") {
+			continue // 防御：列还没加（理论不会发生，AutoMigrate 已跑）
+		}
+		// MySQL/SQLite 通用 UPDATE...WHERE IN (SELECT)
+		if err := DB.Exec(fmt.Sprintf(
+			"UPDATE `%s` SET tenant_id = (SELECT tenant_id FROM user_identities WHERE user_identities.external_id = `%s`.user_id LIMIT 1) WHERE user_id IN (SELECT external_id FROM user_identities)",
+			table, table)).Error; err != nil {
+			return fmt.Errorf("backfill %s from user_identities: %w", table, err)
+		}
+		if err := BackfillTenantID(DB, table); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migrateAgentsTenantID 回填 agents 存量行的 tenant_id（启动租户），并把旧的
+// 全局唯一索引 uk_name 换成复合索引 uk_tenant_name (tenant_id, name)——
+// 加列和建新索引由 AutoMigrate 完成，这里只负责回填 + 删旧索引。
+func migrateAgentsTenantID() error {
+	if DB == nil {
+		return nil
+	}
+	m := DB.Migrator()
+	if err := BackfillTenantID(DB, "agents"); err != nil {
+		return err
+	}
+	if m.HasIndex(&agent.AgentConfig{}, "uk_name") {
+		if err := m.DropIndex(&agent.AgentConfig{}, "uk_name"); err != nil {
+			return fmt.Errorf("drop agents.uk_name: %w", err)
+		}
+		log.Println("Dropped agents.uk_name (replaced by uk_tenant_name)")
+	}
+	return nil
+}
+
+// migrateProvidersTenantID 回填 provider_summaries 存量行的 tenant_id（启动
+// 租户），并把旧的全局唯一索引 uk_key 换成复合索引 uk_tenant_key
+// (tenant_id, key)——加列和建新索引由 AutoMigrate 完成，这里只负责回填 +
+// 删旧索引。provider_attributes / provider_models 子表不加 tenant 列，
+// 归属校验经主表。注意：本次回填之后播种的种子 provider 走共享语义
+// （tenant_id=”），回填只发生在加列后的这一次。
+func migrateProvidersTenantID() error {
+	if DB == nil {
+		return nil
+	}
+	m := DB.Migrator()
+	// uk_key is the one-time migration marker. Once it has been removed,
+	// tenant_id='' rows are the intentional shared provider templates seeded
+	// after migration and must stay shared. Re-running BackfillTenantID on every
+	// restart would collide with a tenant-specific provider using the same key.
+	if !m.HasIndex(&provider.ProviderSummary{}, "uk_key") {
+		return nil
+	}
+	if err := BackfillTenantID(DB, "provider_summaries"); err != nil {
+		return err
+	}
+	if err := m.DropIndex(&provider.ProviderSummary{}, "uk_key"); err != nil {
+		return fmt.Errorf("drop provider_summaries.uk_key: %w", err)
+	}
+	log.Println("Dropped provider_summaries.uk_key (replaced by uk_tenant_key)")
+	return nil
+}
+
+// migrateMcpToolsSkillsScenesTenantID 回填 mcp_servers / tools / skills /
+// scenes 四表存量行的 tenant_id（启动租户），并把旧的全局唯一索引 uk_name
+// 换成复合索引 uk_tenant_name (tenant_id, name)——加列和建新索引由
+// AutoMigrate 完成，这里只负责回填 + 删旧索引。
+//
+// 触发判据是双判据（OR 关系）：
+//  1. 旧全局唯一索引 uk_name 仍存在于任一四表（常规升级形态：AutoMigrate
+//     已建 uk_tenant_name，本函数删掉 uk_name 后重跑即为纯 no-op）；
+//  2. 四表中存在“遗留未回填行”（tenant_id=” 的行中，排除本就合法的共享
+//     行）——覆盖生产实锤的 legacy 形态：库的 schema 本就无 uk_name（从未
+//     走过旧索引版本），判据 1 永不命中，回填被静默跳过，全部行停留共享域
+//     造成跨租户泄漏。
+//
+// 判据 2 刻意不附加“backfillTenantID 非空”：曾有的这个前置条件会把
+// “无法推断目标租户”（user_identities 为空或含多个租户）的情况也一并短路，
+// 于是遗留行既不回填也不报错，静默留在共享域。现在该情况下判据 2 命中后
+// 立即返回显式错误，且报错发生在任何破坏性 DDL 之前。
+//
+// 遗留行判定的表间差异：skills/scenes 无共享语义，任何 tenant_id=” 行
+// 都是无歧义的遗留信号；tools/mcps 的 ” 行可能是合法共享模板（预设/
+// 内置行），需分别排除 PresetToolNames 名单与 is_builtin=1 的行。
+// 迁移块尾的内置行归零 UPDATE 保证幂等：跑完后判据 2 的条件全部为假，
+// 重启不再触发。
+//
+// 内置行处理（决策 1A）：tools/mcps 的内置行（is_builtin=true，及
+// tools SeedIfEmpty 的预设行）是全平台模板，回填后统一改回共享语义
+// tenant_id=”；scenes 有 agent_id 归属列，优先按 agents 主表回填，
+// 映射不到的再走启动租户兜底。关联表（agent_tools/agent_skills/
+// agent_mcp_servers）不加 tenant 列，归属校验经主表。
+func migrateMcpToolsSkillsScenesTenantID() error {
+	if DB == nil {
+		return nil
+	}
+	m := DB.Migrator()
+
+	legacyModels := map[string]interface{}{
+		"mcp_servers": &mcp.McpServer{},
+		"tools":       &agent.Tool{},
+		"skills":      &skill.Skill{},
+		"scenes":      &scene.Scene{},
+	}
+
+	// 幂等守卫：回填 + 归零 + 删旧索引只在真正执行迁移的那一次跑。判据
+	// 之一是旧全局唯一索引 uk_name 仍存在；判据之二是四表存在遗留未回填
+	// 行（见函数头注释）。归零 UPDATE 绝不能每次启动都跑：租户可与共享
+	// 预设行同名（('org-a','Skill') 与 ('','Skill') 合法共存），无条件按
+	// 名单归零会把租户私有行劫持进共享域，甚至撞 uk_tenant_name 唯一索引
+	// 导致启动失败。
+	// P1：第二判据不得挂在 backfillTenantID != "" 上。当无法推断租户
+	// （user_identities 为 0 行或 ≥2 行）且该库从未有过 uk_name 时，四张表里
+	// tenant_id='' 的遗留行此前既不回填也不报错，永久留在共享域被所有租户
+	// 读到——正是本函数要修的泄漏类型。现在改为：检测到遗留行而回填目标
+	// 不可推断时，**在任何破坏性 DDL 之前**直接报错，把静默降级成显式失败。
+	needsMigration := false
+	for _, model := range legacyModels {
+		if m.HasIndex(model, "uk_name") {
+			needsMigration = true
+			break
+		}
+	}
+	if !needsMigration && hasLegacyUnbackfilledRows() {
+		if backfillTenantID == "" {
+			return fmt.Errorf(
+				"检测到存量数据 tenant_id 为空且无法自动推断目标租户（user_identities 为空或含多个租户）：请临时配置 CASDOOR_ORGANIZATION 指定回填目标，完成本次一次性迁移后移除该配置",
+			)
+		}
+		needsMigration = true
+	}
+
+	if needsMigration {
+		// scenes：先按 agents 主表回填（同 migrateChatTenantID 的 JOIN 回填）
+		if m.HasColumn("scenes", "tenant_id") {
+			if err := DB.Exec(
+				"UPDATE `scenes` SET tenant_id = (SELECT tenant_id FROM `agents` WHERE `agents`.id = `scenes`.agent_id LIMIT 1) WHERE agent_id IN (SELECT id FROM `agents`)",
+			).Error; err != nil {
+				return fmt.Errorf("backfill scenes from agents: %w", err)
+			}
+		}
+
+		for _, table := range []string{"mcp_servers", "tools", "skills", "scenes"} {
+			if err := BackfillTenantID(DB, table); err != nil {
+				return err
+			}
+		}
+
+		// 回填后，内置行改为共享（''）：这些是全平台模板，不属于任何租户。
+		// 注：tools 表没有 is_builtin 列（预设行名单见下一条 UPDATE）。
+		if err := DB.Exec("UPDATE `mcp_servers` SET tenant_id = '' WHERE is_builtin = ?", true).Error; err != nil {
+			return fmt.Errorf("reset builtin mcp_servers to shared: %w", err)
+		}
+		// tools 的 SeedIfEmpty/SeedBuiltins 预设行没有 is_builtin 标志，按
+		// agent.PresetToolNames 固定名单一并归入共享模板——名单与 seeding
+		// 同源维护，新增预设工具两处自动同步。
+		placeholders := make([]string, len(agent.PresetToolNames))
+		args := make([]interface{}, len(agent.PresetToolNames))
+		for i, name := range agent.PresetToolNames {
+			placeholders[i] = "?"
+			args[i] = name
+		}
+		if err := DB.Exec(
+			fmt.Sprintf("UPDATE `tools` SET tenant_id = '' WHERE name IN (%s)", strings.Join(placeholders, ",")),
+			args...,
+		).Error; err != nil {
+			return fmt.Errorf("reset seeded tools to shared: %w", err)
+		}
+	}
+
+	for table, model := range legacyModels {
+		// 刻意不受 ALLOW_DESTRUCTIVE_MIGRATIONS 约束：idx 的存在本身就是本段
+		// 迁移的幂等标记（判据 1），不删掉它会让整段迁移每次启动重跑 ——
+		// 其中包括把内置行 tenant_id 归零的 UPDATE，而那条 UPDATE 每次跑都
+		// 会劫持同名的租户私有行，甚至撞 uk_tenant_name 导致启动失败。
+		if m.HasIndex(model, "uk_name") {
+			if err := m.DropIndex(model, "uk_name"); err != nil {
+				return fmt.Errorf("drop %s.uk_name: %w", table, err)
+			}
+			log.Printf("Dropped %s.uk_name (replaced by uk_tenant_name)", table)
+		}
+	}
+	return nil
+}
+
+// hasLegacyUnbackfilledRows 判定四表是否存在“遗留未回填行”（tenant_id=”
+// 且不属于合法共享模板的行），作为无 uk_name 旧索引的 legacy 库触发回填的
+// 第二判据：tools 排除 PresetToolNames 预设行（预设本就是共享 ”）、
+// mcp_servers 排除 is_builtin=1 的内置行；skills/scenes 无共享语义，任何
+// ” 行都是遗留信号。迁移块尾的归零 UPDATE 保证本判据跑完后为假（幂等）。
+func hasLegacyUnbackfilledRows() bool {
+	placeholders := make([]string, len(agent.PresetToolNames))
+	args := make([]interface{}, len(agent.PresetToolNames))
+	for i, name := range agent.PresetToolNames {
+		placeholders[i] = "?"
+		args[i] = name
+	}
+	type legacyQuery struct {
+		sql  string
+		args []interface{}
+	}
+	queries := []legacyQuery{
+		{fmt.Sprintf("SELECT COUNT(*) FROM `tools` WHERE tenant_id = '' AND name NOT IN (%s)", strings.Join(placeholders, ",")), args},
+		{"SELECT COUNT(*) FROM `mcp_servers` WHERE tenant_id = '' AND is_builtin = 0", nil},
+		{"SELECT COUNT(*) FROM `skills` WHERE tenant_id = ''", nil},
+		{"SELECT COUNT(*) FROM `scenes` WHERE tenant_id = ''", nil},
+	}
+	for _, q := range queries {
+		var n int64
+		if err := DB.Raw(q.sql, q.args...).Scan(&n).Error; err != nil {
+			// 计数失败按“未触发”处理，让后续 BackfillTenantID/HasColumn
+			// 路径暴露真正的错误，而非在这里猜测原因。
+			log.Printf("legacy backfill detection query failed (%v), skipping criterion: %v", q.sql, err)
+			continue
+		}
+		if n > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// migrateBindingFKRESTRICT 存量 MySQL 绑定表资源侧外键迁移（issue #123
+// review P2）：GORM AutoMigrate 对已存在的同名约束不比较、不更新
+// DELETE_RULE——旧库升级后绑定表资源侧 FK（skill_id / mcp_server_id /
+// tool_id）仍为 ON DELETE CASCADE，守卫检查与删除之间的并发绑定写入窗口
+// 依旧会被级联静默摘除。本迁移将迁移范围**精确限定为三个目标关系**（review
+// P3：禁止按列名泛匹配——其他审计/历史/插件表同名列可能有意 CASCADE 或
+// SET NULL），逐 target 定位约束并重建为 ON DELETE RESTRICT（幂等：
+// DELETE_RULE 已是 RESTRICT 即跳过；每个 target 最多一个约束，多于一个
+// fail-fast 以防 schema 漂移）。Agent 侧 FK（agent_id → agents.id）保持
+// CASCADE 不动（删除 Agent 绑定随行消亡）。仅 MySQL 生效；SQLite（测试/
+// 嵌入式）由 AutoMigrate 直接按模型建表。
+func migrateBindingFKRESTRICT() error {
+	if DB == nil || DB.Dialector.Name() != "mysql" {
+		return nil
+	}
+	type targetFK struct {
+		Table  string
+		Column string
+		Ref    string
+	}
+	// 精确白名单：agent_skills.skill_id → skills.id 等三个关系
+	targets := []targetFK{
+		{Table: "agent_skills", Column: "skill_id", Ref: "skills"},
+		{Table: "agent_mcp_servers", Column: "mcp_server_id", Ref: "mcp_servers"},
+		{Table: "agent_tools", Column: "tool_id", Ref: "tools"},
+	}
+	type fk struct {
+		ConstraintName string
+		RefCol         string
+	}
+	for _, t := range targets {
+		var fks []fk
+		err := DB.Raw(`SELECT rc.CONSTRAINT_NAME AS constraint_name, kcu.REFERENCED_COLUMN_NAME AS ref_col
+			FROM information_schema.REFERENTIAL_CONSTRAINTS rc
+			JOIN information_schema.KEY_COLUMN_USAGE kcu
+			  ON kcu.CONSTRAINT_SCHEMA = rc.CONSTRAINT_SCHEMA AND kcu.CONSTRAINT_NAME = rc.CONSTRAINT_NAME
+			WHERE rc.CONSTRAINT_SCHEMA = DATABASE()
+			  AND rc.DELETE_RULE <> 'RESTRICT'
+			  AND kcu.TABLE_SCHEMA = DATABASE()
+			  AND kcu.REFERENCED_TABLE_SCHEMA = DATABASE()
+			  AND kcu.TABLE_NAME = ?
+			  AND kcu.COLUMN_NAME = ?
+			  AND rc.REFERENCED_TABLE_NAME = ?`,
+			t.Table, t.Column, t.Ref).Scan(&fks).Error
+		if err != nil {
+			return fmt.Errorf("query binding FK %s.%s: %w", t.Table, t.Column, err)
+		}
+		if len(fks) > 1 {
+			return fmt.Errorf("unexpected multi-column or duplicate FK on %s.%s: refusing to rewrite", t.Table, t.Column)
+		}
+		for _, f := range fks {
+			// 形状校验（review P4）：父列必须恰为 id——schema 漂移为其他
+			// 唯一列时拒绝改写，绝不静默重建为 skill_id → <table>.id
+			if f.RefCol != "id" {
+				return fmt.Errorf("FK %s.%s references %s.%s, want %s.id: schema drift, refusing to rewrite",
+					t.Table, t.Column, t.Ref, f.RefCol, t.Ref)
+			}
+			// 约束完整形状：该约束的全部 KCU 行数（含其他列）——复合外键
+			// 时按列过滤只看到 1 行，必须整体查证，拒绝单列重建破坏约束
+			var kcuCount int64
+			if err := DB.Raw(`SELECT COUNT(*) FROM information_schema.KEY_COLUMN_USAGE
+				WHERE CONSTRAINT_SCHEMA = DATABASE() AND TABLE_NAME = ? AND CONSTRAINT_NAME = ?`,
+				t.Table, f.ConstraintName).Scan(&kcuCount).Error; err != nil {
+				return fmt.Errorf("query FK shape %s.%s: %w", t.Table, f.ConstraintName, err)
+			}
+			if kcuCount != 1 {
+				return fmt.Errorf("FK %s.%s is composite (%d columns): schema drift, refusing to rewrite",
+					t.Table, f.ConstraintName, kcuCount)
+			}
+			// 拆两条语句：MySQL 不允许同一条 ALTER 中 DROP 后 ADD 同名约束（1826）
+			drop := fmt.Sprintf("ALTER TABLE `%s` DROP FOREIGN KEY `%s`", t.Table, f.ConstraintName)
+			if err := DB.Exec(drop).Error; err != nil {
+				return fmt.Errorf("drop FK %s.%s: %w", t.Table, f.ConstraintName, err)
+			}
+			add := fmt.Sprintf("ALTER TABLE `%s` ADD CONSTRAINT `%s` FOREIGN KEY (`%s`) REFERENCES `%s`(`id`) ON DELETE RESTRICT",
+				t.Table, f.ConstraintName, t.Column, t.Ref)
+			if err := DB.Exec(add).Error; err != nil {
+				return fmt.Errorf("rebuild FK %s.%s: %w", t.Table, f.ConstraintName, err)
+			}
+			log.Printf("migrateBindingFKRESTRICT: %s.%s → ON DELETE RESTRICT", t.Table, f.ConstraintName)
+		}
+	}
+	return nil
+}
+
+// migrateDropLegacyUkTenantName 清理索引改名残留：复合唯一索引原名
+// uk_tenant_name 在 agents/tools/skills/mcp_servers/scenes 五表共用（MySQL
+// 索引名 table-scoped 合法，SQLite 全局唯一会撞名，导致真实 AutoMigrate
+// 无法在 sqlite 测试库上运行），已改为每表唯一名（uk_agents_tenant_name
+// 等）。旧库升级后 AutoMigrate 会建好新名索引，这里删掉旧名残留；新库
+// 无旧名索引，纯 no-op，天然幂等。
+func migrateDropLegacyUkTenantName() error {
+	if DB == nil {
+		return nil
+	}
+	m := DB.Migrator()
+	for table, model := range map[string]interface{}{
+		"agents":      &agent.AgentConfig{},
+		"tools":       &agent.Tool{},
+		"skills":      &skill.Skill{},
+		"mcp_servers": &mcp.McpServer{},
+		"scenes":      &scene.Scene{},
+	} {
+		if m.HasIndex(model, "uk_tenant_name") {
+			if err := m.DropIndex(model, "uk_tenant_name"); err != nil {
+				return fmt.Errorf("drop %s.uk_tenant_name: %w", table, err)
+			}
+			log.Printf("Dropped %s.uk_tenant_name (replaced by per-table unique index)", table)
+		}
+	}
+	return nil
+}
+
+// migrateAigcConfigsTenantID 把 aigc_configs 的升级遗留 ” 行归属回填租户。
+// ” 行来源：从"id 恒为 1"的单行全局配置时代升级——列以 default:” 加出，
+// 存量全局行落为 ”。方案 A 语义：aigc 标识为纯 per-tenant 配置（无共享
+// 回退），遗留全局行归属回填租户（显式指定或 user_identities 推断出的
+// 唯一租户），与其他业务表的回填语义一致。
+//
+// 碰撞处理：aigc_configs 有 uk_tenant_id 唯一索引，若回填租户已保存自有
+// 行（如 v2.0.0-preupgrade 演练库中租户已配置过标识）且又存在 ” 遗留行，
+// 直接 UPDATE 会撞唯一索引导致启动失败。此时删除 ” 遗留行、保留租户
+// 自有的较新行——遗留共享行是旧全局配置的快照，租户自有行代表其当前
+// 意愿，保留后者。
+//
+// 幂等：首次运行后不再有 ” 行，重跑 no-op。backfillTenantID 为空时交给
+// BackfillTenantID 统一兜底：无 ” 行放行（已迁移完成的正常重启），有 ”
+// 行返回指引性错误（配置一次 CASDOOR_ORGANIZATION 的逃生舱）。
+// NULL 归一为兜底：正常代码路径不会写出 NULL（列 NOT NULL DEFAULT ”），
+// 仅异常中间态（手工改库、中断的半迁移）可能产生，归一后走统一回填。
+func migrateAigcConfigsTenantID() error {
+	if DB == nil {
+		return nil
+	}
+	m := DB.Migrator()
+	if !m.HasTable("aigc_configs") || !m.HasColumn("aigc_configs", "tenant_id") {
+		return nil
+	}
+	if err := DB.Exec("UPDATE aigc_configs SET tenant_id = '' WHERE tenant_id IS NULL").Error; err != nil {
+		return fmt.Errorf("normalize aigc_configs tenant_id: %w", err)
+	}
+	if backfillTenantID != "" {
+		// 碰撞检查：回填租户已有自有行时，'' 遗留行归并会导致唯一索引冲突，
+		// 删除遗留行以保留租户自有配置。
+		var own int64
+		if err := DB.Raw("SELECT COUNT(*) FROM aigc_configs WHERE tenant_id = ?", backfillTenantID).Scan(&own).Error; err != nil {
+			return fmt.Errorf("count aigc_configs rows for backfill tenant %q: %w", backfillTenantID, err)
+		}
+		if own > 0 {
+			res := DB.Exec("DELETE FROM aigc_configs WHERE tenant_id = ''")
+			if res.Error != nil {
+				return fmt.Errorf("drop legacy shared aigc_configs rows: %w", res.Error)
+			}
+			if res.RowsAffected > 0 {
+				log.Printf("Deleted %d legacy shared aigc_configs rows (tenant %q already has its own config)", res.RowsAffected, backfillTenantID)
+			}
+		}
+	}
+	return BackfillTenantID(DB, "aigc_configs")
+}
+
+// BackfillTenantID 把存量行的空 tenant_id 回填为启动租户（幂等：只动空值）。
+// "空即存量"的前提是各 model 的 tenant_id 列以 default:” 加出——AutoMigrate
+// 的 ADD COLUMN ... NOT NULL DEFAULT ” 会把全部存量行一次性填为 ”，因此
+// WHERE tenant_id = ” OR tenant_id IS NULL 恰好命中且仅命中存量行；共享行
+// 的空串语义在回填之后才由代码引入，不会与回填条件冲突。
+//
+// 回填目标为空串（未显式指定且无法推断）时：无待回填行则放行（no-op，
+// 覆盖新装库与已迁移完成的正常重启）；存在待回填行则返回指引性错误——
+// 这是一次性升级逃生舱的触发点，配置一次 CASDOOR_ORGANIZATION 完成
+// 迁移后即可移除该配置。
+func BackfillTenantID(db *gorm.DB, table string) error {
+	if backfillTenantID == "" {
+		var pending int64
+		if err := db.Raw(fmt.Sprintf("SELECT COUNT(*) FROM `%s` WHERE tenant_id = '' OR tenant_id IS NULL", table)).Scan(&pending).Error; err != nil {
+			return fmt.Errorf("count pending backfill rows in %s: %w", table, err)
+		}
+		if pending > 0 {
+			return fmt.Errorf("表 %s 有 %d 行存量数据无法归属租户（user_identities 为空或含多个租户，无法自动推断）：请临时配置 CASDOOR_ORGANIZATION 指定回填目标，完成本次一次性迁移后移除该配置", table, pending)
+		}
+		return nil
+	}
+	res := db.Exec(fmt.Sprintf("UPDATE `%s` SET tenant_id = ? WHERE tenant_id = '' OR tenant_id IS NULL", table), backfillTenantID)
+	if res.Error != nil {
+		return fmt.Errorf("backfill %s.tenant_id: %w", table, res.Error)
+	}
+	if res.RowsAffected > 0 {
+		log.Printf("Backfilled %d rows in %s to tenant %q", res.RowsAffected, table, backfillTenantID)
+	}
+	return nil
+}

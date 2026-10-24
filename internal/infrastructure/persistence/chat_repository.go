@@ -1,0 +1,312 @@
+package repository
+
+import (
+	"fmt"
+	"log"
+	"time"
+
+	"control-panel/internal/domain/chat"
+	"control-panel/pkg/database"
+
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+)
+
+type ChatRepository struct {
+	db *gorm.DB
+}
+
+func NewChatRepository() *ChatRepository {
+	return &ChatRepository{
+		db: database.GetDB(),
+	}
+}
+
+type ConflictInfo struct {
+	SessionID       string `json:"session_id"`
+	ClientUpdatedAt string `json:"client_updated_at"`
+	ServerUpdatedAt string `json:"server_updated_at"`
+	Resolution      string `json:"resolution"`
+}
+
+type PushResult struct {
+	SyncedSessions  int
+	SkippedSessions int
+	SyncedMessages  int
+	Conflicts       []ConflictInfo
+}
+
+// PushSessions 同步客户端会话到服务端。安全性前提：一个 user_id 只映射一个
+// 租户（casdoor 单组织成员模型），因此 PK (user_id, id) 不含 tenant_id 也不会
+// 出现同 PK 跨租户冲突——该前提若被多组织成员模型打破，需同步调整 PK 设计。
+func (r *ChatRepository) PushSessions(tenantID, userID string, sessions []*chat.Session, messagesPerSession [][]*chat.Message) (*PushResult, error) {
+	result := &PushResult{}
+
+	err := r.db.Transaction(func(tx *gorm.DB) error {
+		for i, sess := range sessions {
+			sess.UserID = userID
+			sess.TenantID = tenantID
+
+			var existing chat.Session
+			err := TenantOwned(tx, tenantID).Where("user_id = ? AND id = ?", userID, sess.ID).First(&existing).Error
+
+			if err == nil {
+				if !existing.UpdatedAt.Before(sess.UpdatedAt) {
+					result.SkippedSessions++
+					result.Conflicts = append(result.Conflicts, ConflictInfo{
+						SessionID:       sess.ID,
+						ClientUpdatedAt: sess.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
+						ServerUpdatedAt: existing.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
+						Resolution:      "skipped: server_data_is_newer_or_equal",
+					})
+					continue
+				}
+			} else if err != gorm.ErrRecordNotFound {
+				return fmt.Errorf("failed to query session %s: %w", sess.ID, err)
+			}
+
+			if err := tx.Clauses(clause.OnConflict{
+				Columns: []clause.Column{{Name: "user_id"}, {Name: "id"}},
+				DoUpdates: clause.AssignmentColumns([]string{
+					"title", "created_at", "updated_at", "model", "system_prompt",
+					"status", "mode", "provider_id", "agent_id", "permission_profile",
+					"hidden", "extra_directories", "is_user_bound",
+					"user_name", "display_name",
+				}),
+			}).Create(sess).Error; err != nil {
+				return fmt.Errorf("failed to upsert session %s: %w", sess.ID, err)
+			}
+
+			if err := TenantOwned(tx, tenantID).Where("user_id = ? AND session_id = ?", userID, sess.ID).Delete(&chat.Message{}).Error; err != nil {
+				return fmt.Errorf("failed to delete messages for session %s: %w", sess.ID, err)
+			}
+
+			sessionMessages := messagesPerSession[i]
+			for _, msg := range sessionMessages {
+				msg.UserID = userID
+				msg.TenantID = tenantID
+				msg.SessionID = sess.ID
+			}
+			normalizeMessageOrder(sessionMessages)
+			if len(sessionMessages) > 0 {
+				if err := tx.CreateInBatches(sessionMessages, 100).Error; err != nil {
+					return fmt.Errorf("failed to insert messages for session %s: %w", sess.ID, err)
+				}
+			}
+
+			result.SyncedSessions++
+			result.SyncedMessages += len(sessionMessages)
+		}
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	log.Printf("[Chat] tenant=%s user=%s pushed=%d skipped=%d messages=%d conflicts=%d",
+		tenantID, userID, result.SyncedSessions, result.SkippedSessions, result.SyncedMessages, len(result.Conflicts))
+
+	return result, nil
+}
+
+// normalizeMessageOrder 保证消息 created_at 严格递增。push 调用方（如
+// agent-runtime 的快照推送）可能给同一会话的所有消息相同的 created_at
+// （transcript 无逐条时间戳），而读路径按 created_at ASC 排序——相同
+// 时间戳下数据库返回顺序未定义（生产曾出现 assistant 排在 user 之前）。
+// 这里以数组顺序为时序真源，必要时把时间戳顶到前一条 +1ms；重放同一
+// 载荷（幂等重推）产生相同结果。
+func normalizeMessageOrder(msgs []*chat.Message) {
+	for i := 1; i < len(msgs); i++ {
+		if !msgs[i].CreatedAt.After(msgs[i-1].CreatedAt) {
+			msgs[i].CreatedAt = msgs[i-1].CreatedAt.Add(time.Millisecond)
+		}
+	}
+}
+
+func (r *ChatRepository) ListSessions(tenantID string, page, pageSize int) ([]*chat.Session, int64, error) {
+	var total int64
+	if err := TenantOwned(r.db.Model(&chat.Session{}), tenantID).Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+
+	var sessions []*chat.Session
+	offset := (page - 1) * pageSize
+	err := TenantOwned(r.db, tenantID).
+		Order("updated_at DESC").Offset(offset).Limit(pageSize).
+		Find(&sessions).Error
+	return sessions, total, err
+}
+
+// ListSessionsByUser 仅返回指定用户的会话（member 数据范围）。
+func (r *ChatRepository) ListSessionsByUser(tenantID, userID string, page, pageSize int) ([]*chat.Session, int64, error) {
+	var total int64
+	if err := TenantOwned(r.db.Model(&chat.Session{}), tenantID).Where("user_id = ?", userID).Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+
+	var sessions []*chat.Session
+	offset := (page - 1) * pageSize
+	err := TenantOwned(r.db, tenantID).Where("user_id = ?", userID).
+		Order("updated_at DESC").
+		Offset(offset).Limit(pageSize).
+		Find(&sessions).Error
+	return sessions, total, err
+}
+
+func (r *ChatRepository) GetSession(tenantID, sessionID string) (*chat.Session, error) {
+	var sess chat.Session
+	err := TenantOwned(r.db, tenantID).Where("id = ?", sessionID).First(&sess).Error
+	if err != nil {
+		return nil, err
+	}
+	return &sess, nil
+}
+
+func (r *ChatRepository) ListMessages(tenantID, sessionID string, page, pageSize int) ([]*chat.Message, int64, error) {
+	var total int64
+	if err := TenantOwned(r.db.Model(&chat.Message{}), tenantID).Where("session_id = ?", sessionID).Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+
+	var messages []*chat.Message
+	offset := (page - 1) * pageSize
+	err := TenantOwned(r.db, tenantID).Where("session_id = ?", sessionID).
+		Order("created_at ASC").
+		Offset(offset).Limit(pageSize).
+		Find(&messages).Error
+	return messages, total, err
+}
+
+// DeleteSession removes a session with its messages and upload records in a
+// single transaction (issue #94 review R2 F3): upload records are the
+// attachment authorization anchors — they must not outlive their session,
+// and a partial failure must never leave records behind for a deleted
+// session.
+func (r *ChatRepository) DeleteSession(tenantID, sessionID string) error {
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		if err := TenantOwned(tx, tenantID).Where("session_id = ?", sessionID).Delete(&chat.UploadRecord{}).Error; err != nil {
+			return err
+		}
+		if err := TenantOwned(tx, tenantID).Where("session_id = ?", sessionID).Delete(&chat.Message{}).Error; err != nil {
+			return err
+		}
+		if err := TenantOwned(tx, tenantID).Where("id = ?", sessionID).Delete(&chat.Session{}).Error; err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+// ListSessionsByAgentAndUser returns sessions for a specific (agent, user) pair.
+// When source is non-empty, only sessions with that source are returned.
+func (r *ChatRepository) ListSessionsByAgentAndUser(tenantID, agentID, userID, source string, page, pageSize int) ([]*chat.Session, int64, error) {
+	var total int64
+	q := TenantOwned(r.db.Model(&chat.Session{}), tenantID).Where("agent_id = ? AND user_id = ?", agentID, userID)
+	if source != "" {
+		q = q.Where("source = ?", source)
+	}
+	if err := q.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+
+	var sessions []*chat.Session
+	offset := (page - 1) * pageSize
+	err := q.Order("updated_at DESC").
+		Offset(offset).Limit(pageSize).
+		Find(&sessions).Error
+	return sessions, total, err
+}
+
+// GetSessionForUser returns a session only if it belongs to the given user.
+// Returns gorm.ErrRecordNotFound if the session does not exist or is owned by another user.
+func (r *ChatRepository) GetSessionForUser(tenantID, sessionID, userID string) (*chat.Session, error) {
+	var sess chat.Session
+	err := TenantOwned(r.db, tenantID).Where("id = ? AND user_id = ?", sessionID, userID).First(&sess).Error
+	if err != nil {
+		return nil, err
+	}
+	return &sess, nil
+}
+
+// CreateSession inserts a new session. The tenant is always stamped from the
+// tenantID argument — the caller-provided model value is not trusted.
+func (r *ChatRepository) CreateSession(tenantID string, sess *chat.Session) error {
+	sess.TenantID = tenantID
+	return r.db.Create(sess).Error
+}
+
+// CreateMessage inserts a new message. The tenant is always stamped from the
+// tenantID argument — the caller-provided model value is not trusted.
+func (r *ChatRepository) CreateMessage(tenantID string, msg *chat.Message) error {
+	msg.TenantID = tenantID
+	return r.db.Create(msg).Error
+}
+
+// UpdateSessionRuntimeSessionID updates the runtime SDK session id bound to a
+// control-panel chat session. Empty values are ignored to avoid overwriting an
+// already-bound id with a blank string.
+func (r *ChatRepository) UpdateSessionRuntimeSessionID(tenantID, sessionID, runtimeSessionID string) error {
+	if runtimeSessionID == "" {
+		return nil
+	}
+	return TenantOwned(r.db.Model(&chat.Session{}), tenantID).
+		Where("id = ?", sessionID).
+		Update("runtime_session_id", runtimeSessionID).Error
+}
+
+// UpdateSessionTitle updates the title of a chat session. The title is only
+// overwritten when the current title is empty, preserving any user-edited title.
+func (r *ChatRepository) UpdateSessionTitle(tenantID, sessionID, title string) error {
+	return TenantOwned(r.db.Model(&chat.Session{}), tenantID).
+		Where("id = ? AND (title IS NULL OR title = '')", sessionID).
+		Update("title", title).Error
+}
+
+// CreateUploadRecords batch-inserts server-side upload records in a single
+// transaction (issue #94 review R2 F4): an upload response persists all of
+// its descriptors or none — the runtime has already issued the ids/files, so
+// a partial batch would leave files no record authorizes. The tenant is
+// always stamped from the tenantID argument — the caller-provided model
+// values are not trusted.
+func (r *ChatRepository) CreateUploadRecords(tenantID string, records []*chat.UploadRecord) error {
+	if len(records) == 0 {
+		return nil
+	}
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		for _, rec := range records {
+			rec.TenantID = tenantID
+		}
+		return tx.Create(&records).Error
+	})
+}
+
+// GetUploadRecord returns the upload record for (session, id), tenant-scoped.
+// gorm.ErrRecordNotFound when the id was never issued by an upload in the
+// session — i.e. a client-forged descriptor.
+func (r *ChatRepository) GetUploadRecord(tenantID, sessionID, id string) (*chat.UploadRecord, error) {
+	var rec chat.UploadRecord
+	err := TenantOwned(r.db, tenantID).Where("session_id = ? AND id = ?", sessionID, id).First(&rec).Error
+	if err != nil {
+		return nil, err
+	}
+	return &rec, nil
+}
+
+// HasUploadRecordPath reports whether path was registered by a server-side
+// upload record of the session created in the given runtime container
+// generation (exact container_id equality, zero tolerance — records from
+// previous container generations no longer authorize after a recreate;
+// issue #94 review R3).
+func (r *ChatRepository) HasUploadRecordPath(tenantID, sessionID, path, containerID string) (bool, error) {
+	var count int64
+	err := TenantOwned(r.db.Model(&chat.UploadRecord{}), tenantID).
+		Where("session_id = ? AND path = ? AND container_id = ?", sessionID, path, containerID).Count(&count).Error
+	return count > 0, err
+}
+
+// DeleteMessageByID deletes one message of a session (used to roll back the
+// optimistic user-message persist when the runtime rejects the run).
+func (r *ChatRepository) DeleteMessageByID(tenantID, sessionID, messageID string) error {
+	return TenantOwned(r.db, tenantID).Where("session_id = ? AND id = ?", sessionID, messageID).Delete(&chat.Message{}).Error
+}

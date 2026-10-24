@@ -1,0 +1,548 @@
+package services
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"sort"
+	"strings"
+	"time"
+
+	"control-panel/internal/domain/agent"
+	repository "control-panel/internal/infrastructure/persistence"
+	"control-panel/pkg/oss"
+
+	"gorm.io/gorm"
+)
+
+type ToolService struct {
+	repo      *repository.ToolRepository
+	agentRepo *repository.AgentRepository
+	uploader  oss.OSSUploader
+}
+
+func NewToolService(uploader oss.OSSUploader) *ToolService {
+	return &ToolService{
+		repo:      repository.NewToolRepository(),
+		agentRepo: repository.NewAgentRepository(),
+		uploader:  uploader,
+	}
+}
+
+// presetToolSpec 是预设工具的单源定义：名字集合必须与 agent.PresetToolNames
+// 一一对应（seedAlways=true 的三条走 SeedBuiltins 幂等补种，其余走
+// SeedIfEmpty 空表首种）。新增预设工具时改 agent.PresetToolNames + 这里。
+type presetToolSpec struct {
+	tool       agent.Tool
+	seedAlways bool
+}
+
+var presetToolSpecs = []presetToolSpec{
+	{agent.Tool{Name: "Skill", Title: "技能加载", Description: "加载专门的技能，为特定任务提供领域专用指令和工作流程", DescriptionEn: "Load a specialized skill that provides domain-specific instructions and workflows for a given task", IsDefault: false}, true},
+	{agent.Tool{Name: "Task", Title: "任务派发", Description: "将子任务派发给指定的子 Agent 执行，获取其结果", DescriptionEn: "Dispatch a subtask to a designated sub-agent and retrieve its result", IsDefault: false}, true},
+	{agent.Tool{Name: "MultiTask", Title: "并行任务派发", Description: "一次性将多个子任务并行派发给子 Agent 执行", DescriptionEn: "Dispatch multiple subtasks to sub-agents in parallel and collect their results", IsDefault: false}, true},
+	{agent.Tool{Name: "Bash", Title: "执行命令", Description: "在持久化的 shell 会话中执行 bash 命令，支持超时和工作目录设置", DescriptionEn: "Execute bash commands in a persistent shell session, with timeout and working-directory support", IsDefault: false}, false},
+	{agent.Tool{Name: "Read", Title: "读取文件", Description: "读取文件内容，支持文本文件、图片和 PDF，带行号显示", DescriptionEn: "Read file contents — text files, images and PDFs — with line numbers", IsDefault: false}, false},
+	{agent.Tool{Name: "Write", Title: "写入文件", Description: "将内容写入指定文件，不存在则创建，存在则覆盖", DescriptionEn: "Write content to a file; creates it if missing, overwrites it if present", IsDefault: false}, false},
+	{agent.Tool{Name: "Edit", Title: "编辑文件", Description: "对文件执行精确的字符串替换，支持多行匹配", DescriptionEn: "Apply precise string replacements to a file, with multi-line matching support", IsDefault: false}, false},
+	{agent.Tool{Name: "Glob", Title: "搜索文件", Description: "按 glob 模式匹配查找文件，支持递归搜索", DescriptionEn: "Find files matching a glob pattern, with recursive search support", IsDefault: false}, false},
+	{agent.Tool{Name: "Grep", Title: "搜索内容", Description: "使用正则表达式搜索文件内容，支持文件类型过滤和上下文行", DescriptionEn: "Search file contents with regular expressions, supporting file-type filters and context lines", IsDefault: false}, false},
+	{agent.Tool{Name: "WebFetch", Title: "获取网页", Description: "从 URL 获取内容并返回文本。支持 HTML 页面、JSON API 和普通文本，自动去除 HTML 标签以便阅读。", DescriptionEn: "Fetch content from a URL and return it as text; supports HTML pages, JSON APIs and plain text", IsDefault: false}, false},
+	{agent.Tool{Name: "WebSearch", Title: "网络搜索", Description: "使用 Exa AI 搜索实时网络信息，返回标题、URL 和摘要。适用于当前事件、最新数据或知识截止日期之后的信息。", DescriptionEn: "Search the web in real time with Exa AI, returning titles, URLs and summaries", IsDefault: false}, false},
+	{agent.Tool{Name: "AskUserQuestion", Title: "用户提问", Description: "向用户提出问题并要求选择答案，支持单选和多选，适用于需要用户做决策的场景。", DescriptionEn: "Ask the user a structured question with predefined choices; supports single and multi-select", IsDefault: false}, false},
+	{agent.Tool{Name: "CronCreate", Title: "创建定时任务", Description: "创建定时任务，支持周期性任务（cron 表达式）和一次性任务（延迟秒数）。", DescriptionEn: "Create a scheduled task, supporting cron expressions and one-shot delays", IsDefault: false}, false},
+	{agent.Tool{Name: "CronDelete", Title: "删除定时任务", Description: "删除一个已创建的定时任务。", DescriptionEn: "Delete an existing scheduled task by its task ID", IsDefault: false}, false},
+	{agent.Tool{Name: "CronList", Title: "列出定时任务", Description: "列出所有已创建的定时任务。", DescriptionEn: "List all currently scheduled tasks with their next-fire times", IsDefault: false}, false},
+	{agent.Tool{Name: "Config", Title: "配置管理", Description: "获取或设置配置值，支持会话级别的设置管理。", DescriptionEn: "Get or set configuration values, with session-scoped settings support", IsDefault: false}, false},
+	{agent.Tool{Name: "TodoWrite", Title: "待办事项", Description: "创建并管理当前会话的结构化任务列表，跟踪任务进度和状态。", DescriptionEn: "Create and manage a structured task list for the current session, tracking progress and status", IsDefault: false}, false},
+	{agent.Tool{Name: "FindTool", Title: "查找工具", Description: "查找尚未加载的可用工具，支持关键词搜索或精确名称选择。", DescriptionEn: "Find and activate tools that exist but are not yet loaded, by exact name or keyword search", IsDefault: false}, false},
+}
+
+func init() {
+	byName := make(map[string]presetToolSpec, len(presetToolSpecs))
+	for _, s := range presetToolSpecs {
+		byName[s.tool.Name] = s
+	}
+	if len(byName) != len(agent.PresetToolNames) {
+		panic("presetToolSpecs and agent.PresetToolNames are out of sync")
+	}
+	for _, name := range agent.PresetToolNames {
+		if _, ok := byName[name]; !ok {
+			panic("presetToolSpecs and agent.PresetToolNames are out of sync")
+		}
+	}
+}
+
+// builtinTools lists the built-in tools that must always exist in the database.
+// Order matters only for determinism; each row is seeded idempotently.
+var builtinTools = func() []agent.Tool {
+	tools := make([]agent.Tool, 0, len(presetToolSpecs))
+	for _, s := range presetToolSpecs {
+		if s.seedAlways {
+			tools = append(tools, s.tool)
+		}
+	}
+	return tools
+}()
+
+// SeedBuiltins ensures built-in tools exist in the database. Idempotent: rows
+// that already exist (matched by Name) are left untouched. This covers both
+// first-time bootstrap and the upgrade path where only "Skill" pre-exists.
+// SeedBuiltins 是系统路径（tenantID=”）：内置行写入为共享行。
+func (s *ToolService) SeedBuiltins() error {
+	const sysTenant = ""
+	for i := range builtinTools {
+		t := builtinTools[i]
+		t.Source = agent.ToolSourceBuiltin
+		exists, err := s.repo.ExistsByName(sysTenant, t.Name)
+		if err != nil {
+			return fmt.Errorf("check builtin %s tool failed: %w", t.Name, err)
+		}
+		if exists {
+			continue
+		}
+		if err := s.repo.Create(sysTenant, &t); err != nil {
+			return fmt.Errorf("create builtin %s tool failed: %w", t.Name, err)
+		}
+	}
+	return nil
+}
+
+type ToolDTO struct {
+	ID             uint64 `json:"id"`
+	Name           string `json:"name"`
+	Title          string `json:"title"`
+	Description    string `json:"description"`
+	DescriptionEn  string `json:"descriptionEn"`
+	IsDefault      bool   `json:"isDefault"`
+	Source         string `json:"source"`
+	ArtifactStatus string `json:"artifactStatus"`
+	FileName       string `json:"fileName,omitempty"`
+	FileURL        string `json:"-"` // issue #88: object key 不外泄给前端；字段保留供服务层测试与内部使用
+	FileHash       string `json:"fileHash,omitempty"`
+	FileSize       int64  `json:"fileSize,omitempty"`
+	CreatedAt      string `json:"createdAt"`
+	UpdatedAt      string `json:"updatedAt"`
+}
+
+func toolToDTO(t *agent.Tool) *ToolDTO {
+	dto := &ToolDTO{
+		ID:             t.ID,
+		Name:           t.Name,
+		Title:          t.Title,
+		Description:    t.Description,
+		DescriptionEn:  t.DescriptionEn,
+		IsDefault:      t.IsDefault,
+		Source:         t.Source,
+		ArtifactStatus: t.ArtifactStatus(),
+		CreatedAt:      t.CreatedAt.UTC().Format(time.RFC3339),
+		UpdatedAt:      t.UpdatedAt.UTC().Format(time.RFC3339),
+	}
+	if t.Source == agent.ToolSourceCustom {
+		dto.FileName = t.FileName
+		dto.FileURL = t.FileURL
+		dto.FileHash = t.FileHash
+		dto.FileSize = t.FileSize
+	}
+	return dto
+}
+
+// CreateCustomToolInput 创建请求：展示元数据 + 内嵌制品三元组（ToolFileInput）。
+type CreateCustomToolInput struct {
+	Name          string
+	Title         string
+	Description   string
+	DescriptionEn string
+	ToolFileInput
+}
+
+type UpdateToolInput struct {
+	Title         *string `json:"title"`
+	Description   *string `json:"description"`
+	DescriptionEn *string `json:"descriptionEn"`
+}
+
+func (s *ToolService) ListAll(tenantID string) ([]*ToolDTO, error) {
+	tools, err := s.repo.ListAll(tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("list tools failed: %w", err)
+	}
+	dtos := make([]*ToolDTO, 0, len(tools))
+	for _, t := range tools {
+		dtos = append(dtos, toolToDTO(t))
+	}
+	return dtos, nil
+}
+
+// getTool 统一按名取 Tool 的错误契约（issue #88）：仓储返回
+// gorm.ErrRecordNotFound 时映射为 agent.ErrToolNotFound（携带工具名，
+// errors.Is 可判，handler 据此映射 404）；其余 DB 错误包装为内部错误，
+// 绝不伪装成 not-found。
+func (s *ToolService) getTool(tenantID, name string) (*agent.Tool, error) {
+	t, err := s.repo.GetByName(tenantID, name)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, fmt.Errorf("%w: %s", agent.ErrToolNotFound, name)
+		}
+		return nil, fmt.Errorf("query tool failed: %w", err)
+	}
+	return t, nil
+}
+
+func (s *ToolService) GetByName(tenantID, name string) (*ToolDTO, error) {
+	t, err := s.getTool(tenantID, name)
+	if err != nil {
+		return nil, err
+	}
+	return toolToDTO(t), nil
+}
+
+// CreateCustomTool 创建租户自定义工具（multipart 上传，issue #88）：先上传
+// 内容寻址对象，再落库；落库失败回滚删对象（skill 先例）。
+func (s *ToolService) CreateCustomTool(tenantID string, input *CreateCustomToolInput) (*ToolDTO, error) {
+	if err := ValidateToolName(input.Name); err != nil {
+		return nil, err
+	}
+	if s.uploader == nil {
+		return nil, agent.ErrToolStorageDisabled
+	}
+	exists, err := s.repo.ExistsByName(tenantID, input.Name)
+	if err != nil {
+		return nil, fmt.Errorf("check tool existence failed: %w", err)
+	}
+	if exists {
+		return nil, fmt.Errorf("%w: %s", agent.ErrToolNameExists, input.Name)
+	}
+	data, ext, hash, err := validateToolFileBytes(input.FileName, input.FileSize, input.File)
+	if err != nil {
+		return nil, err
+	}
+	ossKey := BuildToolOSSKey(tenantID, input.Name, hash, ext)
+	ctx := context.Background()
+	if _, err := s.uploader.Upload(ctx, ossKey, bytes.NewReader(data), int64(len(data))); err != nil {
+		return nil, fmt.Errorf("upload tool file failed: %w", err)
+	}
+	t := &agent.Tool{
+		Name:          input.Name,
+		Title:         input.Title,
+		Description:   input.Description,
+		DescriptionEn: input.DescriptionEn,
+		Source:        agent.ToolSourceCustom,
+		FileName:      input.FileName,
+		FileURL:       ossKey,
+		FileHash:      hash,
+		FileSize:      int64(len(data)),
+	}
+	if err := s.repo.Create(tenantID, t); err != nil {
+		_ = s.uploader.Delete(ctx, ossKey)
+		return nil, fmt.Errorf("create tool failed: %w", err)
+	}
+
+	return toolToDTO(t), nil
+}
+
+func (s *ToolService) Update(tenantID, name string, input *UpdateToolInput) (*ToolDTO, error) {
+	t, err := s.getTool(tenantID, name)
+	if err != nil {
+		return nil, err
+	}
+	if t.IsBuiltin() {
+		return nil, agent.ErrToolIsBuiltin
+	}
+	if input.Title != nil {
+		t.Title = *input.Title
+	}
+	if input.Description != nil {
+		t.Description = *input.Description
+	}
+	if input.DescriptionEn != nil {
+		t.DescriptionEn = *input.DescriptionEn
+	}
+	if err := s.repo.Update(tenantID, t); err != nil {
+		return nil, fmt.Errorf("update tool failed: %w", err)
+	}
+
+	return toolToDTO(t), nil
+}
+
+// UploadToolFile 同时承担存量 missing 补传与 ready 替换（issue #88）。
+func (s *ToolService) UploadToolFile(tenantID, name string, input *ToolFileInput) (*ToolDTO, error) {
+	t, err := s.getTool(tenantID, name)
+	if err != nil {
+		return nil, err
+	}
+	if t.IsBuiltin() {
+		return nil, agent.ErrToolIsBuiltin
+	}
+	if s.uploader == nil {
+		return nil, agent.ErrToolStorageDisabled
+	}
+	data, ext, hash, err := validateToolFileBytes(input.FileName, input.FileSize, input.File)
+	if err != nil {
+		return nil, err
+	}
+	newKey := BuildToolOSSKey(tenantID, t.Name, hash, ext)
+	ctx := context.Background()
+	if _, err := s.uploader.Upload(ctx, newKey, bytes.NewReader(data), int64(len(data))); err != nil {
+		return nil, fmt.Errorf("upload tool file failed: %w", err)
+	}
+	oldKey := t.FileURL
+	t.FileName = input.FileName
+	t.FileURL = newKey
+	t.FileHash = hash
+	t.FileSize = int64(len(data))
+	// 顺序契约（与 Delete 的行先对象后一致）：上传 → DB 提交 → 失败才回滚
+	// 清理。repo.Update 失败时旧行原封不动，oldKey 仍是该存活行的 live
+	// artifact，绝不能删；仅当 newKey != oldKey（不同内容 → 不同 key）才删
+	// 刚上传的 newKey——同内容同 key 时它是完好旧行仍在引用的对象。
+	if err := s.repo.Update(tenantID, t); err != nil {
+		if newKey != oldKey {
+			_ = s.uploader.Delete(ctx, newKey)
+		}
+		return nil, fmt.Errorf("update tool artifact failed: %w", err)
+	}
+	if oldKey != "" && oldKey != newKey {
+		if err := s.uploader.Delete(ctx, oldKey); err != nil {
+			log.Printf("cleanup of old tool file failed (tool=%s, key=%s): %v", t.Name, oldKey, err)
+		}
+	}
+	return toolToDTO(t), nil
+}
+
+func (s *ToolService) Delete(tenantID, name string) error {
+	t, err := s.getTool(tenantID, name)
+	if err != nil {
+		return err
+	}
+	if t.IsBuiltin() {
+		return agent.ErrToolIsBuiltin
+	}
+	own, foreign, err := s.repo.GetToolBindingsScoped(tenantID, t.ID)
+	if err != nil {
+		return fmt.Errorf("query tool agent associations failed: %w", err)
+	}
+	if len(own) > 0 || foreign {
+		return &agent.ToolInUseError{ToolName: t.Name, Agents: own, Foreign: foreign}
+	}
+	// 顺序契约（expert review Fix 1）：先删 DB 行，后清 OSS 对象。若先删对象
+	// 而行删除失败，会残留指向已删对象的 ready 行（false-ready），下载/部署
+	// 随之断裂；先删行则最坏情况只是留下一个孤立对象（见下），行与对象始终一致。
+	key := t.FileURL
+	if err := s.repo.Delete(tenantID, t.ID); err != nil {
+		if repository.IsFKConstraintError(err) {
+			// 并发后盾（#123 review P1）：同技能删除——RESTRICT 拒绝 →
+			// 重查绑定给出准确 409 名单。
+			own, foreign, qerr := s.repo.GetToolBindingsScoped(tenantID, t.ID)
+			if qerr == nil {
+				return &agent.ToolInUseError{ToolName: t.Name, Agents: own, Foreign: foreign}
+			}
+		}
+		return fmt.Errorf("delete tool failed: %w", err)
+	}
+	// 行已删成功：残留对象只是无引用方的孤立内容寻址副本，删除失败无害，仅记日志。
+	if key != "" && s.uploader != nil {
+		if err := s.uploader.Delete(context.Background(), key); err != nil {
+			log.Printf("cleanup of OSS tool file failed (tool=%s, key=%s): %v", t.Name, key, err)
+		}
+	}
+	return nil
+}
+
+// Download 对 ready 自定义工具恒返回 presigned 短期地址（issue #88：「下载仅
+// 对 ready 自定义工具开放，返回短期有效地址」）。管理端刻意不走 CDN 永久链接：
+// 公共 CDN URL 仅保留给 deployer 侧制品来源（agent_deployer.go buildArtifactURL）。
+func (s *ToolService) Download(tenantID, name string) (*DownloadDTO, error) {
+	t, err := s.getTool(tenantID, name)
+	if err != nil {
+		return nil, err
+	}
+	if t.IsBuiltin() {
+		return nil, agent.ErrToolIsBuiltin
+	}
+	if t.ArtifactStatus() != agent.ToolArtifactReady {
+		return nil, agent.ErrToolArtifactMissing
+	}
+	if s.uploader == nil {
+		return nil, agent.ErrToolStorageDisabled
+	}
+	url, err := s.uploader.GetPresignedURL(context.Background(), t.FileURL)
+	if err != nil {
+		return nil, fmt.Errorf("generate presigned download URL failed: %w", err)
+	}
+	return &DownloadDTO{URL: url, ExpiresIn: 3600}, nil
+}
+
+// getAgentCfg 统一按名取 Agent 的错误契约（同 getTool 模式）：仓储返回
+// gorm.ErrRecordNotFound 映射 agent.ErrAgentNotFound（errors.Is 可判，handler
+// 据此映射 404）；其余 DB 错误包装为内部错误，绝不伪装成 not-found。
+func (s *ToolService) getAgentCfg(tenantID, agentName string) (*agent.AgentConfig, error) {
+	a, err := s.agentRepo.GetByName(tenantID, agentName)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, fmt.Errorf("%w: %s", agent.ErrAgentNotFound, agentName)
+		}
+		return nil, fmt.Errorf("query agent failed: %w", err)
+	}
+	return a, nil
+}
+
+func (s *ToolService) GetAgentTools(tenantID, agentName string) ([]string, error) {
+	agentCfg, err := s.getAgentCfg(tenantID, agentName)
+	if err != nil {
+		return nil, err
+	}
+	return s.repo.GetToolsByAgent(agentCfg.ID)
+}
+
+func (s *ToolService) UpdateAgentTools(tenantID, agentName string, toolNames []string) error {
+	agentCfg, err := s.getAgentCfg(tenantID, agentName)
+	if err != nil {
+		return err
+	}
+
+	defaultToolNames, err := s.repo.GetDefaultToolNames(tenantID)
+	if err != nil {
+		return fmt.Errorf("get default tool failed: %w", err)
+	}
+	toolNames = mergeStringSlices(toolNames, defaultToolNames)
+
+	// 已有关联名单：存量 missing 工具保持挂载合法，仅拒绝「新增」（issue #88）。
+	currentNames, err := s.repo.GetToolsByAgent(agentCfg.ID)
+	if err != nil {
+		return fmt.Errorf("get agent tools failed: %w", err)
+	}
+	current := make(map[string]bool, len(currentNames))
+	for _, n := range currentNames {
+		current[n] = true
+	}
+
+	var missingNew []string
+	toolIDs := make([]uint64, 0, len(toolNames))
+	for _, toolName := range toolNames {
+		t, err := s.getTool(tenantID, toolName)
+		if err != nil {
+			return err
+		}
+		if t.Source == agent.ToolSourceCustom &&
+			t.ArtifactStatus() == agent.ToolArtifactMissing && !current[toolName] {
+			missingNew = append(missingNew, toolName)
+			continue
+		}
+		toolIDs = append(toolIDs, t.ID)
+	}
+	if len(missingNew) > 0 {
+		return fmt.Errorf("%w：%s", agent.ErrToolArtifactMissing, strings.Join(missingNew, "、"))
+	}
+	return s.repo.ReplaceAgentTools(agentCfg.ID, toolIDs)
+}
+
+// SeedIfEmpty 是系统路径（tenantID=”）：预设行写入为共享行。
+func (s *ToolService) SeedIfEmpty() error {
+	const sysTenant = ""
+	tools, err := s.repo.ListAll(sysTenant)
+	if err != nil {
+		return fmt.Errorf("list tools failed: %w", err)
+	}
+	if len(tools) > 0 {
+		return nil
+	}
+
+	// 预设行单源：presetToolSpecs（与 agent.PresetToolNames 对齐），此处只取
+	// SeedIfEmpty 负责的六条（seedAlways=false）。
+	for _, p := range presetToolSpecs {
+		if p.seedAlways {
+			continue
+		}
+		t := &agent.Tool{
+			Name:          p.tool.Name,
+			Title:         p.tool.Title,
+			Description:   p.tool.Description,
+			DescriptionEn: p.tool.DescriptionEn,
+			Source:        agent.ToolSourceBuiltin,
+		}
+		if err := s.repo.Create(sysTenant, t); err != nil {
+			return fmt.Errorf("create preset tool '%s' failed: %w", t.Name, err)
+		}
+	}
+
+	return nil
+}
+
+// BackfillBuiltinDescriptionEn 为存量内置行补齐英文展示描述（issue #93）：
+// 仅当行存在且 description_en 为空时写入预设英文；非空行与用户自定义
+// title/description 一律不动；幂等，可在启动 seed 链中重复执行。
+func (s *ToolService) BackfillBuiltinDescriptionEn() error {
+	const sysTenant = ""
+	for i := range presetToolSpecs {
+		p := &presetToolSpecs[i]
+		if p.tool.DescriptionEn == "" {
+			continue // 预设本身缺英文：跳过（不该发生，防御）
+		}
+		exists, err := s.repo.ExistsByName(sysTenant, p.tool.Name)
+		if err != nil {
+			return fmt.Errorf("check builtin %s tool failed: %w", p.tool.Name, err)
+		}
+		if !exists {
+			continue // 空表首种由 SeedBuiltins/SeedIfEmpty 负责（已带英文）
+		}
+		got, err := s.repo.GetByName(sysTenant, p.tool.Name)
+		if err != nil {
+			return err
+		}
+		if got.DescriptionEn != "" {
+			continue
+		}
+		got.DescriptionEn = p.tool.DescriptionEn
+		if err := s.repo.Update(sysTenant, got); err != nil {
+			return fmt.Errorf("backfill %s description_en failed: %w", p.tool.Name, err)
+		}
+	}
+	return nil
+}
+
+func mergeStringSlices(base, extra []string) []string {
+	seen := make(map[string]bool, len(base)+len(extra))
+	for _, v := range base {
+		seen[v] = true
+	}
+	for _, v := range extra {
+		seen[v] = true
+	}
+	result := make([]string, 0, len(seen))
+	for k := range seen {
+		result = append(result, k)
+	}
+	sort.Strings(result)
+	return result
+}
+
+// BackfillSubagentToolBindings ensures every agent that has at least one
+// subagent is also bound to the built-in Task and MultiTask tools. This is
+// intended to run once at startup, after SeedBuiltins, to migrate agents
+// created before the auto-mount logic existed. The operation is idempotent:
+// agents already correctly bound are left as-is (EnsureAgentToolBinding
+// counts before insert).
+//
+// 启动回填无租户上下文，显式跨租户全量（ListAllUnscoped）；关联表按 agent_id
+// 过滤，agent 行本身的租户归属在业务写路径（主表先校验）保证。
+func (s *ToolService) BackfillSubagentToolBindings() error {
+	agents, err := s.agentRepo.ListAllUnscoped()
+	if err != nil {
+		return fmt.Errorf("list agents failed: %w", err)
+	}
+	for _, a := range agents {
+		subs, err := s.agentRepo.GetSubagents(a.ID)
+		if err != nil {
+			return fmt.Errorf("get subagents for agent %s failed: %w", a.Name, err)
+		}
+		if len(subs) == 0 {
+			continue
+		}
+		if err := syncSubagentToolBindings(s.agentRepo, s.repo, a.ID, true); err != nil {
+			return err
+		}
+	}
+	return nil
+}
